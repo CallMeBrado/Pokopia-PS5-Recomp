@@ -1,0 +1,51 @@
+# Whitelist: track source, scripts and notes only. Game data, binaries, logs
+# and third-party trees stay out of git.
+*
+!*/
+!*.c
+!*.h
+!*.cpp
+!*.hpp
+!*.inc
+!*.comp
+!*.py
+!*.ps1
+!*.sh
+!*.md
+!*.cmake
+!CMakeLists.txt
+!Makefile
+!.gitignore
+
+# Never track these trees
+upstream/
+toolchain/*
+!toolchain/main.c
+!toolchain/*.ps1
+gfx-bridge/generated/
+gfx-bridge/generated-vi-tests/
+game-bringup/lift/
+game-bringup/temp/
+game-bringup/obj/
+work/
+out/
+debug-captures/
+frame-reference-655360/
+boot/opus-orbis/
+**/obj/
+**/temp/
+*-backup.*
+*.r[0-9]*-backup.*
+
+# Recompiler output (generated from the game binary; regenerate, don't track)
+**/lift*/
+*c_[0-9][0-9][0-9].cpp
+module_*.cpp
+gpu-probe/deps/
+
+# PS5 port: track sources and title metadata, not built titles or logs
+!ps5/probe/param.json
+ps5/dist/
+!ps5/title/param.json
+ps5/logs/
+ps5/ctl/*.elf

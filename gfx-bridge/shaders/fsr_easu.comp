@@ -1,0 +1,54 @@
+#version 450
+// R84: FSR 1 EASU (edge-adaptive spatial upsampling) for the present path.
+// Input: the game's frame (sampled; sRGB views return linear values, which are
+// re-encoded so EASU works in perceptual space as AMD recommends).
+// Output: an RGBA8 storage image at the scanout size, sRGB-encoded values.
+#extension GL_GOOGLE_include_directive : require
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx/ffx_a.h"
+
+layout(push_constant) uniform Constants {
+    uvec4 con0, con1, con2, con3;
+    uvec4 flags; // x: input samples as linear (encode it)
+} pc;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+
+AF4 encode4(AF4 v)
+{
+    if (pc.flags.x == 0u)
+        return v;
+    AF4 lo = v * 12.92;
+    AF4 hi = 1.055 * pow(max(v, AF4(0.0)), AF4(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, lessThanEqual(v, AF4(0.0031308)));
+}
+
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return encode4(textureGather(source, p, 0)); }
+AF4 FsrEasuGF(AF2 p) { return encode4(textureGather(source, p, 1)); }
+AF4 FsrEasuBF(AF2 p) { return encode4(textureGather(source, p, 2)); }
+#include "ffx/ffx_fsr1.h"
+
+layout(local_size_x = 64) in;
+
+void filter_at(AU2 pos)
+{
+    if (any(greaterThanEqual(pos, AU2(imageSize(target)))))
+        return;
+    AF3 color;
+    FsrEasuF(color, pos, pc.con0, pc.con1, pc.con2, pc.con3);
+    imageStore(target, ASU2(pos), AF4(color, 1.0));
+}
+
+void main()
+{
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    filter_at(gxy);
+    gxy.x += 8u;
+    filter_at(gxy);
+    gxy.y += 8u;
+    filter_at(gxy);
+    gxy.x -= 8u;
+    filter_at(gxy);
+}

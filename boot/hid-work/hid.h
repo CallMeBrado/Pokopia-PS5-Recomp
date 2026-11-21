@@ -1,0 +1,55 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef POKOPIA_HORIZON_HID_H
+#define POKOPIA_HORIZON_HID_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+enum { HZN_HID_MEMORY_BYTES = 0x40000, HZN_HID_STYLE_FULLKEY = 1 };
+
+typedef struct {
+    uint64_t aruid;
+    uint32_t styles, ids;
+    bool npad_active, touch_active;
+} HznHidState;
+
+typedef struct {
+    void *opaque;
+    const void *(*read_guest)(void *opaque, uint64_t address, size_t bytes);
+    uint32_t (*open_applet_resource)(void *opaque, uint64_t aruid);
+    uint32_t (*copy_hid_memory)(void *opaque, size_t bytes);
+} HznHidConfig;
+
+typedef struct {
+    bool handled;
+    uint32_t result, command;
+} HznHidReply;
+
+/* Share one state between root and applet resource sessions. Serialize
+ * service calls and publication. aruid is the caller applet's registered ID. */
+void hzn_hid_init(HznHidState *state, uint64_t aruid);
+HznHidReply hzn_hid_send_sync(HznHidState *state, bool resource, const HznHidConfig *config,
+                             uint8_t *tls, size_t size);
+
+typedef struct {
+    uint64_t buttons;
+    int32_t lx, ly, rx, ry;
+    bool connected;
+} HznHidPad;
+
+/* Both functions take the host-writable view of the 0x40000 HID object.
+ * Initialize before exposing the first guest mapping. Serialize publishers
+ * and keep this view alive while any guest mapping is accessible. */
+bool hzn_hid_memory_init(void *memory, size_t bytes);
+void hzn_hid_publish(void *memory, const HznHidState *hid, const HznHidPad *pad);
+
+#ifdef __ORBIS__
+/* Open one standard pad for the active PS4 user. Negative means unavailable. */
+int hzn_hid_ps4_open(void);
+bool hzn_hid_ps4_read(int handle, HznHidPad *pad);
+void hzn_hid_ps4_close(int handle);
+#endif
+
+#endif
+

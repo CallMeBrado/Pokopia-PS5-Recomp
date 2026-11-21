@@ -1,0 +1,42 @@
+#version 450
+// R84: FSR 1 RCAS (robust contrast-adaptive sharpening) after EASU.
+// Input and output hold sRGB-encoded values; the output image may be an sRGB
+// image written through a UNORM view, so the final blit to the scanout keeps them.
+#extension GL_GOOGLE_include_directive : require
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx/ffx_a.h"
+
+layout(push_constant) uniform Constants {
+    uvec4 con;
+} pc;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(source, p, 0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "ffx/ffx_fsr1.h"
+
+layout(local_size_x = 64) in;
+
+void filter_at(AU2 pos)
+{
+    if (any(greaterThanEqual(pos, AU2(imageSize(target)))))
+        return;
+    AF3 color;
+    FsrRcasF(color.r, color.g, color.b, pos, pc.con);
+    imageStore(target, ASU2(pos), AF4(color, 1.0));
+}
+
+void main()
+{
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    filter_at(gxy);
+    gxy.x += 8u;
+    filter_at(gxy);
+    gxy.y += 8u;
+    filter_at(gxy);
+    gxy.x -= 8u;
+    filter_at(gxy);
+}
