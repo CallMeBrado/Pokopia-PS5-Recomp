@@ -634,6 +634,10 @@ volatile int nvn_replay_trace_submits;
  * its targets and sampled textures are dumped to the debug mailbox. */
 char nvn_replay_dump_hash[24];
 unsigned nvn_replay_dump_width; /* R82: only a draw sampling a texture this wide */
+unsigned nvn_replay_dump_height; /* R91: ... and this tall (0: any) */
+/* R91: skip the first N distinct matching textures (several share a size). */
+unsigned nvn_replay_dump_skip, nvn_replay_dump_seen_count;
+static const void *dump_seen[16];
 volatile int nvn_replay_dump_pending;
 static bool tracing;
 #define TRACE(...) do { if (tracing) fprintf(nvn_replay_trace_log, __VA_ARGS__); } while (0)
@@ -2911,11 +2915,25 @@ static NvnFrontReplyKind run_draw_generic(NvnReplay *replay, uint64_t device, co
         fputc('\n', nvn_replay_trace_log);
     }
     bool dump_width_ok = !nvn_replay_dump_width;
-    for (uint32_t i = 0; i < draw.texture_count && !dump_width_ok; ++i)
-        dump_width_ok = draw.textures[i].texture && draw.textures[i].texture->extent.width == nvn_replay_dump_width;
-    if (drawn && nvn_replay_dump_pending && dump_width_ok &&
-        ((stages[0].hash && !strcmp(stages[0].hash, nvn_replay_dump_hash)) ||
-         (stage_count > 1 && stages[1].hash && !strcmp(stages[1].hash, nvn_replay_dump_hash)))) {
+    const void *dump_texture = NULL;
+    for (uint32_t i = 0; i < draw.texture_count && !dump_width_ok; ++i) {
+        dump_width_ok = draw.textures[i].texture && draw.textures[i].texture->extent.width == nvn_replay_dump_width &&
+                        (!nvn_replay_dump_height || draw.textures[i].texture->extent.height == nvn_replay_dump_height);
+        if (dump_width_ok)
+            dump_texture = draw.textures[i].texture;
+    }
+    const bool dump_shader = (stages[0].hash && !strcmp(stages[0].hash, nvn_replay_dump_hash)) ||
+                             (stage_count > 1 && stages[1].hash && !strcmp(stages[1].hash, nvn_replay_dump_hash));
+    if (drawn && nvn_replay_dump_pending && dump_width_ok && dump_shader && nvn_replay_dump_skip) {
+        bool seen = false;
+        for (unsigned i = 0; i < nvn_replay_dump_seen_count && i < 16; ++i)
+            seen |= dump_seen[i] == dump_texture;
+        if (!seen && nvn_replay_dump_seen_count < 16)
+            dump_seen[nvn_replay_dump_seen_count++] = dump_texture;
+        if (seen || nvn_replay_dump_seen_count <= nvn_replay_dump_skip)
+            dump_width_ok = false;
+    }
+    if (drawn && nvn_replay_dump_pending && dump_width_ok && dump_shader) {
         nvn_replay_dump_pending = 0;
         PokopiaVkAdapter *adapter = config->opaque;
         char path[256];

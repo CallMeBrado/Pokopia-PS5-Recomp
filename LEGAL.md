@@ -12,7 +12,8 @@ Entertainment Inc. They are used here only to describe what this software works 
 
 This repository contains no game code, game data, art, audio, text, shaders or keys, and none
 will be accepted. The PlayStation button glyphs and the on-screen keyboard are drawn by scripts
-in this repository (`ps5/scripts/gen-ps-glyphs.py`, `ps5/scripts/gen-osk-font.py`). No builds are
+in this repository (`ps5/scripts/gen-ps-glyphs.py`, `ps5/scripts/gen-ps-title.py`,
+`ps5/scripts/gen-osk-font.py`). No builds are
 distributed. To use it you need your own legally obtained copy of the game, which you dump and
 recompile yourself.
 

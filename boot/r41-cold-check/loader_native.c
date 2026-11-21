@@ -311,11 +311,15 @@ static void update_guest_pad(void)
                 FILE *dump_request = fopen(trace_request, "r");
                 if (dump_request) {
                     char hash[24] = {0};
-                    unsigned width = 0;
-                    if (fscanf(dump_request, "%23s %u", hash, &width) >= 1) {
-                        extern unsigned nvn_replay_dump_width;
+                    unsigned width = 0, height = 0, skip = 0;
+                    if (fscanf(dump_request, "%23s %u %u %u", hash, &width, &height, &skip) >= 1) {
+                        extern unsigned nvn_replay_dump_width, nvn_replay_dump_height, nvn_replay_dump_skip,
+                            nvn_replay_dump_seen_count;
                         memcpy(nvn_replay_dump_hash, hash, sizeof hash);
                         nvn_replay_dump_width = width;
+                        nvn_replay_dump_height = height;
+                        nvn_replay_dump_skip = skip;
+                        nvn_replay_dump_seen_count = 0;
                         nvn_replay_dump_pending = 1;
                     }
                     fclose(dump_request);

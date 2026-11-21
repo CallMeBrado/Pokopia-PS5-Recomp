@@ -4,6 +4,7 @@
 #include "vk_ledger.h"
 #include "vk_flush.h"
 #include "ps_button_glyphs.h"
+#include "ps_title_glyphs.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -388,23 +389,47 @@ static uint64_t glyph_atlas_hash(const uint8_t *data, size_t bytes)
     return hash;
 }
 
+/* R91: and the title logo texture (1024x1024 BC7) has "PRESS (A) BUTTON"
+ * baked in; its (A) becomes the Circle glyph (ps_title_glyphs.h,
+ * ps5/scripts/gen-ps-title.py). */
+typedef struct {
+    uint16_t x, y, width, height;
+    const uint8_t *blocks;
+} GlyphPatch;
+
 static uint8_t *ps_glyph_patch(VkFormat format, VkExtent2D extent, uint32_t mip, uint32_t layers,
                                const uint8_t *linear, size_t bytes)
 {
     enum { BLOCK = 16, ROW_BLOCKS = PS_GLYPH_ATLAS_SIZE / 4 };
+    _Static_assert(PS_GLYPH_ATLAS_SIZE == PS_TITLE_TEXTURE_SIZE, "both patched textures are 1024x1024");
     if (mip || layers != 1 || extent.width != PS_GLYPH_ATLAS_SIZE || extent.height != PS_GLYPH_ATLAS_SIZE ||
         (format != VK_FORMAT_BC7_UNORM_BLOCK && format != VK_FORMAT_BC7_SRGB_BLOCK) ||
-        bytes != (size_t)ROW_BLOCKS * ROW_BLOCKS * BLOCK || glyph_atlas_hash(linear, bytes) != PS_GLYPH_ATLAS_HASH)
+        bytes != (size_t)ROW_BLOCKS * ROW_BLOCKS * BLOCK)
         return NULL;
+    const uint64_t hash = glyph_atlas_hash(linear, bytes);
+    const void *table;
+    size_t count;
+    if (hash == PS_GLYPH_ATLAS_HASH) {
+        table = ps_glyph_patches;
+        count = sizeof ps_glyph_patches / sizeof ps_glyph_patches[0];
+    } else if (hash == PS_TITLE_TEXTURE_HASH) {
+        table = ps_title_patches;
+        count = sizeof ps_title_patches / sizeof ps_title_patches[0];
+    } else {
+        return NULL;
+    }
+    _Static_assert(sizeof ps_glyph_patches[0] == sizeof(GlyphPatch) && sizeof ps_title_patches[0] == sizeof(GlyphPatch),
+                   "patch tables share one layout");
+    const GlyphPatch *patches = table;
     uint8_t *patched = malloc(bytes);
     if (!patched)
         return NULL;
     memcpy(patched, linear, bytes);
-    for (size_t i = 0; i < sizeof ps_glyph_patches / sizeof ps_glyph_patches[0]; ++i) {
-        const size_t x = ps_glyph_patches[i].x / 4, y = ps_glyph_patches[i].y / 4;
-        const size_t width = ps_glyph_patches[i].width / 4, height = ps_glyph_patches[i].height / 4;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t x = patches[i].x / 4, y = patches[i].y / 4;
+        const size_t width = patches[i].width / 4, height = patches[i].height / 4;
         for (size_t row = 0; row < height; ++row)
-            memcpy(patched + ((y + row) * ROW_BLOCKS + x) * BLOCK, ps_glyph_patches[i].blocks + row * width * BLOCK,
+            memcpy(patched + ((y + row) * ROW_BLOCKS + x) * BLOCK, patches[i].blocks + row * width * BLOCK,
                    width * BLOCK);
     }
     return patched;
