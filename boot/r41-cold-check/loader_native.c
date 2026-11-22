@@ -2966,18 +2966,54 @@ static NvnFrontReplyKind nvn_acquire_texture(uint64_t window, uint64_t sync_addr
     uint32_t *index = write_guest(NULL, output, sizeof *index);
     if (!index || !nvn_window_get(windows, window, &info) || (device && device != info.device))
         return NVN_FRONT_INVALID_GUEST;
+    const uint64_t acquire_start = stat_now_ns();
+    uint64_t worker_ns = 0, fence_ns = 0, drain_ns = 0;
+    bool was_deferred = false, was_pending = false;
     if (sync_address) {
         NvnHostSync *sync = find_nvn_sync(sync_address, info.device);
         if (!sync)
             return NVN_FRONT_INVALID_GUEST;
-        if (wait_nvn_sync(&graphics, sync, UINT64_MAX) != VK_SUCCESS)
+        /* R93: wait with every lock released, as nvnSyncWait does (R79). This
+         * call holds the graphics lock (and the global one), so wait_nvn_sync
+         * spun in vkWaitForFences with both held: ~0.7 s stalls every ~1.3 s
+         * while the replay worker sat behind the graphics lock. */
+        GuestBoundary *scope = pokopia_host_thread();
+        const bool kernel = scope && scope->kernel_locked;
+        if (kernel)
+            kernel_unlock();
+        const unsigned rec_held = rec_release_all();
+        const unsigned gfx_held = gfx_release_all();
+        if (sync->signal_seq)
+            replay_wait_for(sync->signal_seq);
+        const uint64_t fence_start = stat_now_ns();
+        worker_ns = fence_start - acquire_start;
+        was_deferred = sync->deferred;
+        was_pending = sync->pending;
+        const VkResult waited = wait_nvn_sync(&graphics, sync, UINT64_MAX);
+        fence_ns = stat_now_ns() - fence_start;
+        gfx_restore(gfx_held);
+        rec_restore(rec_held);
+        if (kernel)
+            kernel_lock();
+        if (waited != VK_SUCCESS)
             return NVN_FRONT_BOUNDARY;
     }
     uint32_t acquired;
     bool got = nvn_window_acquire(windows, window, &acquired);
     if (!got && replay_worker_running) {
+        const uint64_t drain_start = stat_now_ns();
         replay_drain(); /* R78: images are released as the worker presents */
+        drain_ns = stat_now_ns() - drain_start;
         got = nvn_window_acquire(windows, window, &acquired);
+    }
+    /* R93: any acquire over 50 ms, by where the time went. */
+    const uint64_t acquire_ns = stat_now_ns() - acquire_start;
+    if (acquire_ns > UINT64_C(50000000)) {
+        static unsigned logged;
+        if (logged++ < 400)
+            fprintf(probe_log, "Acquire stall ms=%.1f worker=%.1f fence=%.1f (deferred=%d pending=%d) drain=%.1f t=%.1fs\n",
+                acquire_ns * 1e-6, worker_ns * 1e-6, fence_ns * 1e-6, was_deferred, was_pending, drain_ns * 1e-6,
+                pokopia_boot_monotonic_ns() * 1e-9);
     }
     if (got) {
         memcpy(index, &acquired, sizeof acquired);
