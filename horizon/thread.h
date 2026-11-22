@@ -39,9 +39,17 @@ typedef struct {
     void (*worker_error)(void *opaque, uint32_t handle, const char *operation, int32_t error);
     /* Optional waitable table. Keep it alive until every thread is joined. */
     HznEvents *events;
+    /* Optional host timer for sub-millisecond sleeps on the main thread. */
+    bool (*use_precise_main_sleep)(void);
+    uint64_t (*precise_sleep_clock)(void);
 } HznThreadConfig;
 
 HznThreads *hzn_threads_create(const HznThreadConfig *config);
+
+#if defined(__PROSPERO__)
+/* Temporarily bind the calling host thread to a core in its allowed set. */
+void hzn_thread_test_affinity(unsigned cpu_rank, bool enabled);
+#endif
 
 /* Run before other SVC handlers so workers can observe process teardown at
  * every SVC. False means another service owns the call or CloseHandle value. */

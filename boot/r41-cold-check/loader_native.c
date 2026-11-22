@@ -369,10 +369,10 @@ static void update_guest_pad(void)
                 /* R90: debug/flags holds A/B switches (see vk_flush.h). */
                 snprintf(trace_request, sizeof trace_request, "%s/flags", live_capture.mailbox.directory);
                 FILE *flags_file = fopen(trace_request, "r");
-                unsigned flags = 0;
+                unsigned flags = POKOPIA_DEBUG_DEFAULTS; /* R94: no file, the tuned set */
                 if (flags_file) {
                     if (fscanf(flags_file, "%u", &flags) != 1)
-                        flags = 0;
+                        flags = POKOPIA_DEBUG_DEFAULTS;
                     fclose(flags_file);
                 }
                 if (flags != pokopia_debug_flags) {
@@ -485,7 +485,9 @@ static ServiceSession service_sessions[128];
 #ifndef _WIN32
 /* R44 load stats: where loading time goes, one line every 5 s from the
  * present hook. Counters are relaxed atomics; the report swaps them to 0. */
-#define STAT_ADD(counter, value) atomic_fetch_add_explicit(&(counter), (value), memory_order_relaxed)
+/* R94: statistics only: a plain load and store, no locked add. The locked adds
+ * on these shared lines ran several times per graphics call on every thread. */
+#define STAT_ADD(counter, value)     atomic_store_explicit(&(counter), atomic_load_explicit(&(counter), memory_order_relaxed) + (value),                           memory_order_relaxed)
 #define STAT_TAKE(counter) atomic_exchange_explicit(&(counter), 0, memory_order_relaxed)
 enum { STAT_SVCS = 0x80 };
 static atomic_uint_fast64_t stat_lock_calls, stat_lock_contended, stat_lock_wait_ns, stat_lock_hold_ns,
@@ -540,9 +542,22 @@ static void stat_tsc_calibrate(void)
 
 static uint64_t stat_now_ns(void)
 {
-    pthread_once(&stat_tsc_once, stat_tsc_calibrate);
+    /* R94: pthread_once on every read showed in the dispatcher's profile. */
+    static atomic_bool calibrated;
+    if (__builtin_expect(!atomic_load_explicit(&calibrated, memory_order_acquire), 0)) {
+        pthread_once(&stat_tsc_once, stat_tsc_calibrate);
+        atomic_store_explicit(&calibrated, true, memory_order_release);
+    }
     return stat_tsc_base_ns + (uint64_t)((double)(__builtin_ia32_rdtsc() - stat_tsc_base) * stat_ns_per_tick);
 }
+
+#if defined(POKOPIA_GFX)
+static bool use_precise_main_sleep(void)
+{
+    return (pokopia_debug_flags & (1u << 25)) != 0;
+}
+
+#endif
 #else
 #define stat_now_ns stat_clock_ns
 #endif
@@ -595,7 +610,7 @@ static void stat_name_call(const char *name)
     stat_call_name = name;
 }
 
-static void stat_charge_name(uint64_t ns)
+static void stat_charge_name(uint64_t ns, unsigned weight)
 {
     const char *name = stat_call_name ? stat_call_name : "(unnamed)";
     while (atomic_flag_test_and_set_explicit(&stat_names_lock, memory_order_acquire))
@@ -618,8 +633,8 @@ static void stat_charge_name(uint64_t ns)
         slot->name[bytes] = 0;
         slot->key = name;
     }
-    ++slot->calls;
-    slot->ns += ns;
+    slot->calls += weight;
+    slot->ns += ns * weight;
     if (ns > slot->max_ns)
         slot->max_ns = ns;
     atomic_flag_clear_explicit(&stat_names_lock, memory_order_release);
@@ -673,6 +688,8 @@ static void prof_report_fast(FILE *log);
 
 static void fatal_signal(int signal, siginfo_t *info, void *context);
 static _Atomic(StatThread *) prof_host_target;
+static atomic_bool prof_raw_pc_only;
+
 
 /* R68: runs on the sampled thread; records where its host code is. */
 static void prof_host_signal(int signal, siginfo_t *info, void *context)
@@ -680,12 +697,13 @@ static void prof_host_signal(int signal, siginfo_t *info, void *context)
     (void)signal;
     (void)info;
     StatThread *thread = atomic_load_explicit(&prof_host_target, memory_order_acquire);
-    if (!thread)
+    /* A signal delayed beyond its request must not populate another thread's slot. */
+    if (!thread || pthread_self() != thread->host)
         return;
     const ucontext_t *uc = context;
     const uint64_t rip = (uint64_t)uc->uc_mcontext.mc_rip;
     uint64_t caller = 0;
-    if (rip >= UINT64_C(0x800000000)) {
+    if (rip >= UINT64_C(0x800000000) && !atomic_load_explicit(&prof_raw_pc_only, memory_order_relaxed)) {
         /* R76: in a system library (kernel call stubs): find who called it. */
         const uint64_t *stack = (const uint64_t *)uc->uc_mcontext.mc_rsp;
         uint64_t caller2 = 0, caller3 = 0;
@@ -733,6 +751,102 @@ uint64_t pokopia_trace_guest_lr(void)
     Ctx *ctx = stat_thread ? atomic_load_explicit(&stat_thread->ctx, memory_order_acquire) : NULL;
     return ctx ? ctx->x[30] : 0;
 }
+
+#if defined(POKOPIA_GFX)
+/* Capture a short cross-thread timeline in memory. Writing the trace after
+ * capture avoids using time in the middle of the frames being measured. */
+enum { POKOPIA_DEBUG_FRAME_TRACE = 1u << 28, FRAME_TRACE_ROWS = 32768 };
+typedef struct {
+    uint64_t ns, tid, first, second;
+    const char *kind;
+} FrameTraceRow;
+
+enum { TRACE_FIRST = 1, TRACE_SECOND, TRACE_WRITING, TRACE_WAIT_OFF, TRACE_FINISHED };
+static atomic_uint trace_phase = TRACE_FIRST;
+static atomic_uint_fast64_t trace_render_wait_key;
+
+static unsigned frame_trace_active(void)
+{
+    unsigned phase = atomic_load_explicit(&trace_phase, memory_order_acquire);
+    if (!(pokopia_debug_flags & POKOPIA_DEBUG_FRAME_TRACE)) {
+        if (phase == TRACE_WAIT_OFF)
+            atomic_compare_exchange_strong(&trace_phase, &phase, TRACE_SECOND);
+        return 0;
+    }
+    return phase == TRACE_FIRST || phase == TRACE_SECOND ? phase : 0;
+}
+
+static void frame_trace(const char *kind, uint64_t ns, uint64_t first, uint64_t second)
+{
+    static FrameTraceRow rows[FRAME_TRACE_ROWS];
+    static unsigned count;
+    static atomic_flag lock = ATOMIC_FLAG_INIT;
+    const unsigned phase = frame_trace_active();
+    if (!phase)
+        return;
+    while (atomic_flag_test_and_set_explicit(&lock, memory_order_acquire))
+        __builtin_ia32_pause();
+    bool write = false;
+    if (phase == atomic_load_explicit(&trace_phase, memory_order_acquire)) {
+        rows[count++] = (FrameTraceRow){ns ? ns : stat_now_ns(), pokopia_trace_guest_tid(), first, second, kind};
+        if (count == FRAME_TRACE_ROWS) {
+            atomic_store_explicit(&trace_phase, TRACE_WRITING, memory_order_release);
+            count = 0;
+            write = true;
+        }
+    }
+    atomic_flag_clear_explicit(&lock, memory_order_release);
+    if (!write)
+        return;
+    const char *tmp = "/data/pokopia/ps5-codex-sleep-timing.tmp";
+    const char *path = phase == TRACE_FIRST ? "/data/pokopia/ps5-codex-sleep-timing-1.txt" :
+                                             "/data/pokopia/ps5-codex-sleep-timing-2.txt";
+    FILE *trace = fopen(tmp, "w");
+    bool saved = false;
+    if (trace) {
+        for (unsigned i = 0; i < FRAME_TRACE_ROWS; ++i) {
+            const FrameTraceRow *row = &rows[i];
+            fprintf(trace, "%" PRIu64 " t%" PRIu64 " %s %" PRIu64 " %" PRIu64 "\n",
+                    row->ns, row->tid, row->kind, row->first, row->second);
+        }
+        const bool complete = !ferror(trace);
+        saved = fclose(trace) == 0 && complete && rename(tmp, path) == 0;
+    }
+    atomic_store_explicit(&trace_phase, saved && phase == TRACE_FIRST ? TRACE_WAIT_OFF : TRACE_FINISHED,
+                          memory_order_release);
+}
+
+/* Follow SDK wrappers on the calling thread's permanently mapped main stack.
+ * An unrecognized stack or incomplete chain leaves the original LR intact. */
+static uint64_t trace_sleep_caller(const Ctx *context)
+{
+    const uint64_t raw = context->x[30];
+#if defined(POKOPIA_BOOT_PROBE)
+    const uint64_t sp = context->x[31];
+    const uint64_t end = POKOPIA_BOOT_STACK_BASE + POKOPIA_BOOT_STACK_SIZE;
+    if (context == &cpu && sp >= POKOPIA_BOOT_STACK_BASE && sp < end) {
+        uint64_t lr = raw, fp = context->x[29];
+        for (unsigned i = 0; i < 8 && (lr >> 32) == 0x75; ++i) {
+            if (fp < sp || fp > end - 16 || (fp & 7))
+                break;
+            const uint64_t next = rd64(fp);
+            lr = rd64(fp + 8);
+            if ((lr >> 32) == 0x71)
+                return lr;
+            if (next <= fp)
+                break;
+            fp = next;
+        }
+    }
+#endif
+    return raw;
+}
+
+void pokopia_trace_producer(const char *kind, uint64_t ns, uint64_t first, uint64_t second)
+{
+    frame_trace(kind, ns, first, second);
+}
+#endif
 
 /* R70: once a second, launch-relative progress: frames, RomFS reads, and
  * SleepThread accuracy. Covers the boot before the first present too. */
@@ -908,6 +1022,147 @@ static void prof_report(unsigned ticks, unsigned samples)
     memset(prof_slots, 0, sizeof prof_slots);
 }
 
+/* Only prof_main issues requests, one at a time. */
+static bool prof_request_pc(StatThread *thread)
+{
+    atomic_store_explicit(&thread->host_pc_ready, 0, memory_order_relaxed);
+    atomic_store_explicit(&prof_host_target, thread, memory_order_release);
+    if (!pthread_kill(thread->host, SIGUSR2)) {
+        const uint64_t give_up = stat_clock_ns() + 500000;
+        while (!atomic_load_explicit(&thread->host_pc_ready, memory_order_acquire) &&
+               stat_clock_ns() < give_up) {}
+    }
+    atomic_store_explicit(&prof_host_target, NULL, memory_order_release);
+    return atomic_load_explicit(&thread->host_pc_ready, memory_order_acquire) != 0;
+}
+
+#if defined(POKOPIA_GFX)
+/* The SVC owner publishes a unique token only inside its matching sleep.
+ * All counters, PC slots and the selection cursor are owned by prof_main. */
+static atomic_uint_fast64_t wait_work_gate;
+static atomic_bool wait_work_finished;
+enum { WAIT_WORK_TICKS = 5000, WAIT_WORK_PC_SLOTS = 8192 };
+enum WaitWorkState { WAIT_GUEST, WAIT_HOST, WAIT_SVC, WAIT_IMPORT, WAIT_IDLE, WAIT_STATES };
+typedef struct {
+    uint64_t tid;
+    unsigned states[WAIT_STATES], attempted, sampled;
+} WaitWorkThread;
+typedef struct {
+    uint64_t tid, pc;
+    unsigned count;
+} WaitWorkPc;
+static WaitWorkThread wait_work_threads[STAT_THREADS];
+static WaitWorkPc wait_work_pcs[WAIT_WORK_PC_SLOTS];
+
+static enum WaitWorkState wait_work_state(StatThread *thread, const Ctx *ctx, uint64_t tid)
+{
+    if (atomic_load_explicit(&thread->in_svc, memory_order_relaxed))
+        return WAIT_SVC;
+    if (atomic_load_explicit(&thread->in_host, memory_order_relaxed))
+        return WAIT_HOST;
+    if (tid == 999)
+        return WAIT_IDLE;
+    const char *import = *(const char *volatile *)&ctx->in_import;
+    return import && strcmp(import, "-") ? WAIT_IMPORT : WAIT_GUEST;
+}
+
+static void wait_work_record(uint64_t tid, uint64_t pc)
+{
+    const uint64_t hash = (pc ^ (tid * UINT64_C(0x9e3779b97f4a7c15))) * UINT64_C(0xbf58476d1ce4e5b9);
+    for (unsigned probe = 0; probe < WAIT_WORK_PC_SLOTS; ++probe) {
+        WaitWorkPc *slot = &wait_work_pcs[((hash >> 32) + probe) % WAIT_WORK_PC_SLOTS];
+        if (!slot->count || (slot->pc == pc && slot->tid == tid)) {
+            slot->pc = pc;
+            slot->tid = tid;
+            ++slot->count;
+            return;
+        }
+    }
+}
+
+static bool wait_work_save(unsigned ticks, uint64_t first, uint64_t last)
+{
+    const char *tmp = "/data/pokopia/ps5-codex-wait-work.tmp";
+    FILE *file = fopen(tmp, "w");
+    if (!file)
+        return false;
+    fprintf(file, "WAIT_WORK_V1 fatal_signal=%#" PRIxPTR " gate_ticks=%u started_ns=%" PRIu64
+                  " ended_ns=%" PRIu64 "\n", (uintptr_t)fatal_signal, ticks, first, last);
+    for (unsigned i = 0; i < STAT_THREADS; ++i) {
+        const WaitWorkThread *thread = &wait_work_threads[i];
+        if (thread->tid)
+            fprintf(file, "T t%" PRIu64 " guest=%u host=%u svc=%u import=%u idle=%u attempted=%u sampled=%u\n",
+                    thread->tid, thread->states[WAIT_GUEST], thread->states[WAIT_HOST], thread->states[WAIT_SVC],
+                    thread->states[WAIT_IMPORT], thread->states[WAIT_IDLE], thread->attempted, thread->sampled);
+    }
+    for (unsigned i = 0; i < WAIT_WORK_PC_SLOTS; ++i) {
+        const WaitWorkPc *slot = &wait_work_pcs[i];
+        if (slot->count)
+            fprintf(file, "P t%" PRIu64 " %#" PRIx64 " %u\n", slot->tid, slot->pc, slot->count);
+    }
+    const bool complete = !ferror(file);
+    return fclose(file) == 0 && complete && rename(tmp, "/data/pokopia/ps5-codex-wait-work.txt") == 0;
+}
+
+static void wait_work_tick(unsigned count)
+{
+    static unsigned ticks, cursor;
+    static uint64_t first, retry_at;
+    if (!(pokopia_debug_flags & POKOPIA_DEBUG_FRAME_TRACE) ||
+        atomic_load_explicit(&wait_work_finished, memory_order_relaxed))
+        return;
+    const uint64_t gate = atomic_load_explicit(&wait_work_gate, memory_order_acquire);
+    if (!first && !gate)
+        return;
+    const uint64_t now = stat_now_ns();
+    if (!first)
+        first = now;
+    if (ticks == WAIT_WORK_TICKS || now - first >= UINT64_C(60000000000)) {
+        if (now >= retry_at) {
+            if (wait_work_save(ticks, first, now))
+                atomic_store_explicit(&wait_work_finished, true, memory_order_release);
+            retry_at = now + UINT64_C(1000000000);
+        }
+        return;
+    }
+    if (!gate || !count)
+        return;
+    ++ticks;
+    if (count > STAT_THREADS)
+        count = STAT_THREADS;
+    int selected = -1;
+    for (unsigned offset = 0; offset < count; ++offset) {
+        const unsigned i = (cursor + offset) % count;
+        StatThread *thread = &stat_threads[i];
+        const Ctx *ctx = atomic_load_explicit(&thread->ctx, memory_order_acquire);
+        if (!ctx)
+            continue;
+        const uint64_t tid = atomic_load_explicit(&thread->id, memory_order_relaxed);
+        const enum WaitWorkState state = wait_work_state(thread, ctx, tid);
+        wait_work_threads[i].tid = tid;
+        ++wait_work_threads[i].states[state];
+        if (selected < 0 && state == WAIT_GUEST && tid && tid != 1 && tid != 24 && tid != 999)
+            selected = (int)i;
+    }
+    if (selected < 0 || gate != atomic_load_explicit(&wait_work_gate, memory_order_acquire))
+        return;
+    cursor = ((unsigned)selected + 1) % count;
+    StatThread *thread = &stat_threads[selected];
+    WaitWorkThread *worker = &wait_work_threads[selected];
+    ++worker->attempted;
+    atomic_store_explicit(&prof_raw_pc_only, true, memory_order_relaxed);
+    const bool captured = prof_request_pc(thread);
+    atomic_store_explicit(&prof_raw_pc_only, false, memory_order_relaxed);
+    const Ctx *ctx = atomic_load_explicit(&thread->ctx, memory_order_acquire);
+    if (captured && ctx && gate == atomic_load_explicit(&wait_work_gate, memory_order_acquire) &&
+        wait_work_state(thread, ctx, worker->tid) == WAIT_GUEST) {
+        const uint64_t pc = atomic_load_explicit(&thread->host_pc, memory_order_relaxed);
+        wait_work_record(worker->tid, pc);
+        ++worker->sampled;
+    }
+}
+#endif
+
 static void *prof_main(void *unused)
 {
     (void)unused;
@@ -917,22 +1172,24 @@ static void *prof_main(void *unused)
         ++ticks;
         if (ticks % 1000 == 0)
             timeline_tick();
+        /* R94: debug flags bit 16 pauses sampling (a SIGUSR2 to a thread in
+         * host code every millisecond, the replay worker nearly always). */
+        if (pokopia_debug_flags & (1u << 16)) {
+            if (ticks >= PROF_REPORT_SAMPLES)
+                ticks = samples = 0;
+            continue;
+        }
         const unsigned count = atomic_load_explicit(&stat_thread_count, memory_order_acquire);
+#if defined(POKOPIA_GFX)
+        wait_work_tick(count);
+#endif
         for (unsigned i = 0; i < count && i < STAT_THREADS; ++i) {
             StatThread *thread = &stat_threads[i];
             Ctx *ctx = atomic_load_explicit(&thread->ctx, memory_order_acquire);
             if (!ctx)
                 continue;
             if (atomic_load_explicit(&thread->in_host, memory_order_relaxed)) {
-                atomic_store_explicit(&thread->host_pc_ready, 0, memory_order_relaxed);
-                atomic_store_explicit(&prof_host_target, thread, memory_order_release);
-                if (!pthread_kill(thread->host, SIGUSR2)) {
-                    const uint64_t give_up = stat_clock_ns() + 500000;
-                    while (!atomic_load_explicit(&thread->host_pc_ready, memory_order_acquire) &&
-                           stat_clock_ns() < give_up) {}
-                }
-                atomic_store_explicit(&prof_host_target, NULL, memory_order_release);
-                if (atomic_load_explicit(&thread->host_pc_ready, memory_order_acquire)) {
+                if (prof_request_pc(thread)) {
                     const uint64_t caller = atomic_load_explicit(&thread->host_caller, memory_order_relaxed);
                     prof_record(atomic_load_explicit(&thread->id, memory_order_relaxed),
                                 caller ? caller : atomic_load_explicit(&thread->host_pc, memory_order_relaxed),
@@ -1610,11 +1867,70 @@ uint64_t guest_slow_reads, guest_slow_bytes;
  * never sees one being rebuilt), so the check is a short inline loop. A range
  * about to be mapped is published before the map protects it. */
 enum { ALIAS_SNAPSHOTS = 4 };
-static struct {
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX) && defined(POKOPIA_BOOT_PROBE)
+#define POKOPIA_ALIAS_BIN_INDEX
+enum { ALIAS_BIN_SHIFT = 20, ALIAS_BIN_WORDS = 128, POKOPIA_DEBUG_ALIAS_INDEX = 1u << 30 };
+#define ALIAS_INDEX_BYTES ((uint64_t)ALIAS_BIN_WORDS * 64 << ALIAS_BIN_SHIFT)
+#endif
+typedef struct {
     unsigned count;
     uint64_t lo[HZN_HEAP_STACK_ALIAS_LIMIT + 1], hi[HZN_HEAP_STACK_ALIAS_LIMIT + 1];
-} alias_snapshots[ALIAS_SNAPSHOTS];
+#ifdef POKOPIA_ALIAS_BIN_INDEX
+    uint64_t occupied[ALIAS_BIN_WORDS];
+#endif
+} HeapAliasSnapshot;
+static HeapAliasSnapshot alias_snapshots[ALIAS_SNAPSHOTS];
+
+#ifdef POKOPIA_ALIAS_BIN_INDEX
+/* A bit covers a 1 MiB heap interval. A set bit sends the query through the
+ * original precise intersection check, including aliases pending a map. */
+static uint64_t alias_bin_mask(unsigned word, unsigned first, unsigned last)
+{
+    const uint64_t low = word == first / 64 ? UINT64_MAX << (first % 64) : UINT64_MAX;
+    const uint64_t high = word == last / 64 ? UINT64_MAX >> (63 - last % 64) : UINT64_MAX;
+    return low & high;
+}
+
+static void index_heap_aliases(HeapAliasSnapshot *snapshot)
+{
+    const uint64_t base = POKOPIA_BOOT_HEAP_BASE, limit = base + ALIAS_INDEX_BYTES;
+    memset(snapshot->occupied, 0, sizeof snapshot->occupied);
+    for (unsigned i = 0; i < snapshot->count; ++i) {
+        const uint64_t lo = snapshot->lo[i], hi = snapshot->hi[i];
+        if (hi <= lo) {
+            /* Defer any malformed or wrapped interval to the exact scan. */
+            memset(snapshot->occupied, 0xff, sizeof snapshot->occupied);
+            return;
+        }
+        if (hi <= base || lo >= limit)
+            continue;
+        const unsigned first = lo <= base ? 0 : (unsigned)((lo - base) >> ALIAS_BIN_SHIFT);
+        const unsigned last = (unsigned)(((hi < limit ? hi : limit) - 1 - base) >> ALIAS_BIN_SHIFT);
+        for (unsigned w = first / 64; w <= last / 64; ++w)
+            snapshot->occupied[w] |= alias_bin_mask(w, first, last);
+    }
+}
+
+static bool heap_alias_bins_clear(const HeapAliasSnapshot *snapshot, uint64_t offset, size_t size)
+{
+    if (!size || offset >= ALIAS_INDEX_BYTES || size > ALIAS_INDEX_BYTES - offset)
+        return false;
+    const unsigned first = (unsigned)(offset >> ALIAS_BIN_SHIFT);
+    const unsigned last = (unsigned)((offset + size - 1) >> ALIAS_BIN_SHIFT);
+    if (first == last)
+        return !(snapshot->occupied[first / 64] & (UINT64_C(1) << (first % 64)));
+    for (unsigned w = first / 64; w <= last / 64; ++w)
+        if (snapshot->occupied[w] & alias_bin_mask(w, first, last))
+            return false;
+    return true;
+}
+#endif
 static _Atomic unsigned alias_published;
+/* R94: 64 KiB heap blocks known to hold no alias, tagged with the alias
+ * generation they were checked against. The scan over every alias range ran
+ * on each guest access: ~12% of the render thread's host time. */
+static _Atomic uint32_t alias_generation = 1;
+static _Atomic uint64_t plain_blocks[4096];
 static void heap_alias_snapshot(uint64_t pending, uint64_t pending_size)
 {
 #ifdef POKOPIA_BOOT_PROBE
@@ -1634,7 +1950,11 @@ static void heap_alias_snapshot(uint64_t pending, uint64_t pending_size)
         ++count;
     }
     alias_snapshots[next].count = count;
+#ifdef POKOPIA_ALIAS_BIN_INDEX
+    index_heap_aliases(&alias_snapshots[next]);
+#endif
     atomic_store_explicit(&alias_published, next, memory_order_release);
+    atomic_fetch_add_explicit(&alias_generation, 1, memory_order_acq_rel);
 #else
     (void)pending;
     (void)pending_size;
@@ -1647,7 +1967,30 @@ static bool guest_heap_plain(uint64_t address, size_t size)
     if (!size || !heap_size || address < POKOPIA_BOOT_HEAP_BASE || size > heap_size ||
         address - POKOPIA_BOOT_HEAP_BASE > heap_size - size)
         return false;
+    const uint64_t block = address >> 16;
+    const bool one_block = block == (address + size - 1) >> 16;
+    const uint32_t generation = atomic_load_explicit(&alias_generation, memory_order_acquire);
+    const uint64_t tag = (uint64_t)generation << 32 | (uint32_t)block;
+    _Atomic uint64_t *cached = &plain_blocks[(block ^ (block >> 12)) & 4095];
+    if (one_block && atomic_load_explicit(cached, memory_order_relaxed) == tag)
+        return true;
     const unsigned at = atomic_load_explicit(&alias_published, memory_order_acquire);
+    if (one_block) {
+        const uint64_t lo = block << 16, hi = lo + 0x10000;
+        const unsigned count = alias_snapshots[at].count;
+        unsigned i = 0;
+        while (i < count && !(lo < alias_snapshots[at].hi[i] && alias_snapshots[at].lo[i] < hi))
+            ++i;
+        if (i == count) {
+            atomic_store_explicit(cached, tag, memory_order_relaxed);
+            return true;
+        }
+    }
+#ifdef POKOPIA_ALIAS_BIN_INDEX
+    if ((pokopia_debug_flags & POKOPIA_DEBUG_ALIAS_INDEX) &&
+        heap_alias_bins_clear(&alias_snapshots[at], address - POKOPIA_BOOT_HEAP_BASE, size))
+        return true;
+#endif
     const unsigned count = alias_snapshots[at].count;
     const uint64_t end = address + size;
     for (unsigned i = 0; i < count; ++i)
@@ -2044,7 +2387,14 @@ typedef struct {
     VkFence ring[4];
     bool ring_submitted[4];
     unsigned ring_at;
+    PFN_vkWaitForFences wait_fences;
+    PFN_vkGetFenceStatus fence_status;
 } NvnHostSync;
+
+enum {
+    POKOPIA_DEBUG_WAIT_SITES = 64, POKOPIA_DEBUG_FENCE_STATUS = 128, POKOPIA_DEBUG_FENCE_SPIN = 256,
+    POKOPIA_DEBUG_NONBLOCKING_POLL = 512, POKOPIA_DEBUG_AFFINITY = 1u << 26,
+};
 
 /* R78: fence signals waiting for the open draw batch to be submitted. A fence
  * sync submitted the partly recorded batch each time (2,000 a 5 s window,
@@ -2292,6 +2642,7 @@ static void report_load_stats(void)
         window_start = now;
     if (now - window_start < UINT64_C(5000000000))
         return;
+    static uint64_t report_ns; /* R94: how long the previous report took on this thread */
     const double ms = 1e-6;
     const uint64_t window = now - window_start, fsp_bytes = hzn_fsp_romfs_bytes - fsp_bytes_seen;
     window_start = now;
@@ -2314,7 +2665,9 @@ static void report_load_stats(void)
     report_stat_names(probe_log);
     report_thread_stats(probe_log);
     nvn_replay_report_skips(probe_log);
+    fprintf(probe_log, "Stats report previous ms=%.2f tid=%" PRIu64 "\n", report_ns * ms, pokopia_trace_guest_tid());
     fflush(probe_log);
+    report_ns = stat_now_ns() - now;
 }
 #endif
 
@@ -2413,12 +2766,15 @@ static void *create_nvn_sync(void *opaque, void *device)
     if (device != adapter)
         return NULL;
     PFN_vkCreateFence create = (PFN_vkCreateFence)adapter->get_device_proc(adapter->device, "vkCreateFence");
-    if (!create || !adapter->get_device_proc(adapter->device, "vkDestroyFence") ||
-        !adapter->get_device_proc(adapter->device, "vkWaitForFences"))
+    PFN_vkWaitForFences wait_fences = (PFN_vkWaitForFences)
+        adapter->get_device_proc(adapter->device, "vkWaitForFences");
+    if (!create || !adapter->get_device_proc(adapter->device, "vkDestroyFence") || !wait_fences)
         return NULL;
     NvnHostSync *sync = calloc(1, sizeof *sync);
     if (!sync)
         return NULL;
+    sync->wait_fences = wait_fences;
+    sync->fence_status = (PFN_vkGetFenceStatus)adapter->get_device_proc(adapter->device, "vkGetFenceStatus");
     const VkFenceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkResult result = create(adapter->device, &info, NULL, &sync->fence);
     if (result != VK_SUCCESS) {
@@ -2434,24 +2790,74 @@ static void *create_nvn_sync(void *opaque, void *device)
 
 static void replay_wait_for(uint64_t target);
 static uint64_t replay_completed_now(void);
-static VkResult wait_nvn_sync(PokopiaVkAdapter *adapter, NvnHostSync *sync, uint64_t timeout)
+
+typedef struct {
+    uint64_t replay_ns, flush_ns, fence_ns, pending_polls;
+} NvnWaitBreakdown;
+
+static VkResult wait_host_fence(PFN_vkWaitForFences wait, PFN_vkGetFenceStatus get_status,
+                               VkDevice device, VkFence fence, uint64_t timeout, bool can_spin)
+{
+    const unsigned flags = pokopia_debug_flags;
+    if (!timeout && (flags & POKOPIA_DEBUG_FENCE_STATUS) && get_status) {
+        const VkResult status = get_status(device, fence);
+        return status == VK_NOT_READY ? VK_TIMEOUT : status;
+    }
+#if defined(__PROSPERO__)
+    if (can_spin && timeout && (flags & POKOPIA_DEBUG_FENCE_SPIN) && get_status) {
+        const uint64_t start = stat_now_ns();
+        const uint64_t limit = timeout < UINT64_C(150000) ? timeout : UINT64_C(150000);
+        uint64_t elapsed;
+        do {
+            const VkResult status = get_status(device, fence);
+            if (status != VK_NOT_READY)
+                return status;
+            const uint64_t pause_until = stat_now_ns() + UINT64_C(10000);
+            while (stat_now_ns() < pause_until)
+                __builtin_ia32_pause();
+            elapsed = stat_now_ns() - start;
+        } while (elapsed < limit);
+        if (timeout != UINT64_MAX)
+            timeout = elapsed >= timeout ? 0 : timeout - elapsed;
+    }
+#else
+    (void)can_spin;
+#endif
+    return wait(device, 1, &fence, VK_TRUE, timeout);
+}
+
+static VkResult wait_nvn_sync_traced(PokopiaVkAdapter *adapter, NvnHostSync *sync, uint64_t timeout,
+                                     NvnWaitBreakdown *trace)
 {
     if (sync->signal_seq) {
-        /* R78: a poll (timeout 0) waits for the worker too: returning "not yet"
-         * made the game spin on it, taking the graphics lock each time. */
+        /* The guest asks for readiness with timeout zero. Since the poll now
+         * runs under the recording lock, it need not stall behind replay. */
+        if (!timeout && (pokopia_debug_flags & POKOPIA_DEBUG_NONBLOCKING_POLL) &&
+            replay_completed_now() < sync->signal_seq) {
+            if (trace)
+                ++trace->pending_polls;
+            return VK_TIMEOUT;
+        }
+        const uint64_t start = trace ? stat_now_ns() : 0;
         replay_wait_for(sync->signal_seq);
+        if (trace)
+            trace->replay_ns += stat_now_ns() - start;
     }
     if (sync->deferred) { /* R78: its batch has not been submitted yet */
+        const uint64_t start = trace ? stat_now_ns() : 0;
         gfx_lock_late();
         if (sync->deferred)
             pokopia_vk_flush_pending(POKOPIA_FLUSH_SYNC);
         if (sync->deferred)
             submit_deferred_syncs(); /* the batch was already gone */
         gfx_unlock();
+        if (trace)
+            trace->flush_ns += stat_now_ns() - start;
     }
     if (!sync->pending)
         return VK_SUCCESS;
-    PFN_vkWaitForFences wait = (PFN_vkWaitForFences)adapter->get_device_proc(adapter->device, "vkWaitForFences");
+    const PFN_vkWaitForFences wait = sync->wait_fences;
+    const PFN_vkGetFenceStatus get_status = sync->fence_status;
     if (replay_worker_running && !replay_worker_thread && timeout && !gfx_held_now()) {
         /* R79: wait for the GPU with every lock released: the worker could not
          * replay (graphics lock) while a game thread sat here. The fence is the
@@ -2464,17 +2870,28 @@ static VkResult wait_nvn_sync(PokopiaVkAdapter *adapter, NvnHostSync *sync, uint
             kernel_unlock();
         const unsigned rec_held = rec_release_all();
         const unsigned gfx_held = gfx_release_all();
-        const VkResult result = wait(adapter->device, 1, &fence, VK_TRUE, timeout);
+        const uint64_t start = trace ? stat_now_ns() : 0;
+        const VkResult result = wait_host_fence(wait, get_status, adapter->device, fence, timeout, true);
+        if (trace)
+            trace->fence_ns += stat_now_ns() - start;
         gfx_restore(gfx_held);
         rec_restore(rec_held);
         if (kernel)
             kernel_lock();
         return result; /* pending stays set; the next wait finds the fence signaled */
     }
-    VkResult result = wait(adapter->device, 1, &sync->fence, VK_TRUE, timeout);
+    const uint64_t start = trace ? stat_now_ns() : 0;
+    const VkResult result = wait_host_fence(wait, get_status, adapter->device, sync->fence, timeout, false);
+    if (trace)
+        trace->fence_ns += stat_now_ns() - start;
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST)
         sync->pending = false;
     return result;
+}
+
+static VkResult wait_nvn_sync(PokopiaVkAdapter *adapter, NvnHostSync *sync, uint64_t timeout)
+{
+    return wait_nvn_sync_traced(adapter, sync, timeout, NULL);
 }
 
 static void destroy_nvn_sync(void *opaque, void *object)
@@ -2752,16 +3169,19 @@ static bool execute_nvn_compute_generic(void *opaque, const PokopiaGenericComput
 static bool execute_nvn_draw_generic(void *opaque, const PokopiaGenericDraw *draw)
 {
     VkResult result = VK_SUCCESS;
-    const uint64_t prepare_start = stat_now_ns();
+    const unsigned weight = (pokopia_debug_flags & POKOPIA_DEBUG_SAMPLE_DRAWS) ? 16u : 1u;
+    const bool timed = weight == 1 || pokopia_timing_sample(generic_draw_ok + generic_draw_failed);
+    const uint64_t prepare_start = timed ? stat_now_ns() : 0;
     for (uint32_t i = 0; i < draw->texture_count && result == VK_SUCCESS; ++i)
         if (draw->textures[i].guest_info)
             result = pokopia_live_texture_prepare_sample(&texture_upload, draw->textures[i].guest_info);
-    const uint64_t prepare_end = stat_now_ns();
-    generic_prepare_ns += prepare_end - prepare_start;
+    const uint64_t prepare_end = timed ? stat_now_ns() : 0;
+    generic_prepare_ns += (prepare_end - prepare_start) * weight;
     uint64_t serial = 0;
     if (result == VK_SUCCESS)
         result = pokopia_live_draw_generic(opaque, draw, &serial);
-    generic_exec_ns += stat_now_ns() - prepare_end;
+    if (timed)
+        generic_exec_ns += (stat_now_ns() - prepare_end) * weight;
     if (result == VK_SUCCESS)
         ++generic_draw_ok;
     else
@@ -3018,10 +3438,20 @@ static NvnFrontReplyKind nvn_acquire_texture(uint64_t window, uint64_t sync_addr
                 pokopia_boot_monotonic_ns() * 1e-9);
     }
     if (got) {
+#if defined(__PROSPERO__)
+        frame_trace("acquire", 0, acquired, acquire_ns);
+#endif
         memcpy(index, &acquired, sizeof acquired);
         *result = 0;
-        fprintf(probe_log, "NVN acquired game image %u\n", acquired);
-        fflush(probe_log);
+        /* Keep the startup diagnostic. Per-frame log writes can block the
+         * game thread and hold the recording lock across filesystem I/O. */
+        static unsigned logged_acquires;
+        if (logged_acquires < 12 || !(pokopia_debug_flags & (1u << 20))) {
+            if (logged_acquires < 12)
+                ++logged_acquires;
+            fprintf(probe_log, "NVN acquired game image %u\n", acquired);
+            fflush(probe_log);
+        }
     } else {
         *result = 1;
     }
@@ -3118,7 +3548,14 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32]);
  * waits for the worker only when none is free. */
 static NvnFrontReplyKind present_nvn_frame(const uint64_t x[32])
 {
+#if defined(__PROSPERO__)
+    frame_trace("present-call", 0, x[2], 0);
+#endif
     update_guest_pad();
+#if defined(__PROSPERO__)
+    if (pokopia_trace_guest_tid() == 1)
+        hzn_thread_test_affinity(0, (pokopia_debug_flags & POKOPIA_DEBUG_AFFINITY) != 0);
+#endif
     /* R92: the port menu's 30 fps cap. The game thread sleeps after this
      * present until 33 ms after the last one (dispatch_graphics), so FIFO
      * presentation shows each frame for two vblanks. */
@@ -3316,6 +3753,54 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
 }
 #endif
 
+#if defined(__PROSPERO__)
+static void report_nvn_wait_site(uint64_t lr, uint64_t request, bool blocked, uint64_t total,
+                                 const NvnWaitBreakdown *trace)
+{
+    enum { SITE_COUNT = 24 };
+    typedef struct {
+        uint64_t lr, hits, blocked, requested, total;
+        NvnWaitBreakdown trace;
+    } Site;
+    static _Thread_local Site sites[SITE_COUNT];
+    static _Thread_local uint64_t report_at;
+    const uint64_t now = stat_now_ns();
+    if (!report_at)
+        report_at = now + UINT64_C(5000000000);
+    Site *site = &sites[SITE_COUNT - 1];
+    for (unsigned i = 0; i < SITE_COUNT - 1; ++i) {
+        if (!sites[i].hits || sites[i].lr == lr) {
+            site = &sites[i];
+            site->lr = lr;
+            break;
+        }
+    }
+    ++site->hits;
+    site->blocked += blocked;
+    site->requested += blocked && request < UINT64_C(1000000000) ? request : 0;
+    site->total += total;
+    site->trace.replay_ns += trace->replay_ns;
+    site->trace.flush_ns += trace->flush_ns;
+    site->trace.fence_ns += trace->fence_ns;
+    site->trace.pending_polls += trace->pending_polls;
+    if (now < report_at)
+        return;
+    const uint64_t tid = pokopia_trace_guest_tid();
+    for (unsigned i = 0; i < SITE_COUNT; ++i) {
+        const Site *s = &sites[i];
+        if (s->total >= UINT64_C(1000000))
+            fprintf(probe_log, "NVN wait t%" PRIu64 " lr=%#" PRIx64 " count=%" PRIu64 " blocked=%" PRIu64
+                " requested_ms=%.1f total_ms=%.1f worker_ms=%.1f flush_ms=%.1f fence_ms=%.1f"
+                " pending_polls=%" PRIu64 "\n",
+                tid, s->lr, s->hits, s->blocked, s->requested * 1e-6, s->total * 1e-6,
+                s->trace.replay_ns * 1e-6, s->trace.flush_ns * 1e-6, s->trace.fence_ns * 1e-6,
+                s->trace.pending_polls);
+    }
+    memset(sites, 0, sizeof sites);
+    report_at = now + UINT64_C(5000000000);
+}
+#endif
+
 static NvnFrontReplyKind nvn_frame_control(const char *name, uint64_t x[32])
 {
 #if !defined(_WIN32) || defined(POKOPIA_HOST_HEADLESS_PRESENT)
@@ -3328,15 +3813,29 @@ static NvnFrontReplyKind nvn_frame_control(const char *name, uint64_t x[32])
         NvnHostSync *sync = find_nvn_sync(x[0], 0);
         if (!sync)
             return NVN_FRONT_INVALID_GUEST;
-        VkResult result = wait_nvn_sync(&graphics, sync, 0);
+        NvnWaitBreakdown *trace = NULL;
+#if defined(__PROSPERO__)
+        NvnWaitBreakdown sample = {0};
+        if (pokopia_debug_flags & POKOPIA_DEBUG_WAIT_SITES)
+            trace = &sample;
+        const uint64_t start = trace ? stat_now_ns() : 0;
+#endif
+        VkResult result = wait_nvn_sync_traced(&graphics, sync, 0, trace);
+        const bool blocked = result == VK_TIMEOUT && x[1];
         if (result == VK_SUCCESS) {
             x[0] = 0;
-        } else if (result == VK_TIMEOUT && x[1]) {
-            result = wait_nvn_sync(&graphics, sync, x[1]);
+        } else if (blocked) {
+            result = wait_nvn_sync_traced(&graphics, sync, x[1], trace);
             x[0] = result == VK_SUCCESS ? 1 : result == VK_TIMEOUT ? 2 : 3;
         } else {
             x[0] = result == VK_TIMEOUT ? 2 : 3;
         }
+#if defined(__PROSPERO__)
+        if (trace)
+            report_nvn_wait_site(x[30], x[1], blocked, stat_now_ns() - start, trace);
+        if (x[0] == 2 && !x[1])
+            frame_trace("poll-pending", 0, sync->signal_seq, x[30]);
+#endif
         return NVN_FRONT_HANDLED;
     }
     bool acquire = !strcmp(name, "nvnQueueAcquireTexture");
@@ -3363,9 +3862,17 @@ static NvnFrontReplyKind nvn_frame_control(const char *name, uint64_t x[32])
     return execute_nvn_sync(&graphics, sync, false) ? NVN_FRONT_HANDLED : NVN_FRONT_BOUNDARY;
 }
 
-static NvnFrontReplyKind dispatch_nvn_replay(Ctx *context, const char *name, const uint32_t scalar[3])
+static NvnFrontReplyKind dispatch_nvn_replay(Ctx *context, const char *name, const char *static_key,
+                                            const uint32_t scalar[3])
 {
-    NvnFrontReplyKind reply = nvn_replay_dispatch(replay, name, context->x, scalar);
+#if defined(__PROSPERO__)
+    enum { POKOPIA_DEBUG_INTERNED_DISPATCH = 1u << 29 };
+    if (!(pokopia_debug_flags & POKOPIA_DEBUG_INTERNED_DISPATCH))
+        static_key = NULL;
+#else
+    static_key = NULL;
+#endif
+    NvnFrontReplyKind reply = nvn_replay_dispatch_keyed(replay, name, static_key, context->x, scalar);
     NvnReplayMemoryRequest request;
     unsigned callbacks = 0;
     while (reply == NVN_FRONT_BOUNDARY && nvn_replay_take_memory_request(replay, &request)) {
@@ -3432,12 +3939,18 @@ static NvnFrontReplyKind dispatch_nvn_replay(Ctx *context, const char *name, con
             break;
         if ((control ? command.control_revision : command.command_revision) == request.revision)
             break;
-        reply = nvn_replay_dispatch(replay, name, context->x, scalar);
+        reply = nvn_replay_dispatch_keyed(replay, name, static_key, context->x, scalar);
     }
     /* R75: a guest queue submit ends the general-draw batch, so host texel
      * buffers and guest copies see every draw of the submit. */
-    if (!strcmp(name, "nvnQueueSubmitCommands") && !replay_worker_running)
-        pokopia_vk_flush_pending(POKOPIA_FLUSH_QUEUE_SUBMIT);
+    if (!strcmp(name, "nvnQueueSubmitCommands")) {
+#if defined(__PROSPERO__)
+        if (pokopia_trace_guest_tid() == 24)
+            hzn_thread_test_affinity(2, (pokopia_debug_flags & POKOPIA_DEBUG_AFFINITY) != 0);
+#endif
+        if (!replay_worker_running)
+            pokopia_vk_flush_pending(POKOPIA_FLUSH_QUEUE_SUBMIT);
+    }
     return reply;
 }
 
@@ -3722,8 +4235,13 @@ static uint64_t replay_enqueue_item(int kind, void *object, const uint64_t *args
     *slot = (ReplayItem){kind, object, seq, {0}};
     if (args)
         memcpy(slot->args, args, sizeof slot->args);
+    if (!kind && (pokopia_debug_flags & POKOPIA_DEBUG_FRAME_TRACE))
+        nvn_replay_trace_submission(object, seq);
+    const uint64_t queued_at = (pokopia_debug_flags & POKOPIA_DEBUG_FRAME_TRACE) ? stat_now_ns() : 0;
     pthread_cond_broadcast(&replay_cond);
     pthread_mutex_unlock(&replay_mutex);
+    if (queued_at)
+        frame_trace("enqueue", queued_at, seq, (unsigned)kind);
     return seq;
 }
 
@@ -3769,8 +4287,10 @@ static void *replay_worker_main(void *unused)
             atomic_store_explicit(&worker_entry->in_host, 1, memory_order_relaxed);
         const ReplayItem item = replay_items[replay_item_head % REPLAY_QUEUE];
         pthread_mutex_unlock(&replay_mutex);
+        hzn_thread_test_affinity(4, (pokopia_debug_flags & POKOPIA_DEBUG_AFFINITY) != 0);
         gfx_site = "(worker)";
         gfx_lock();
+        frame_trace("begin", 0, item.seq, (unsigned)item.kind);
         bool ok;
         if (item.kind == 0) {
             ok = nvn_replay_run_job(replay, item.object) == NVN_FRONT_HANDLED;
@@ -3800,6 +4320,7 @@ static void *replay_worker_main(void *unused)
         atomic_store_explicit(&replay_completed, item.seq, memory_order_release);
         pthread_cond_broadcast(&replay_cond);
         pthread_mutex_unlock(&replay_mutex);
+        frame_trace("done", 0, item.seq, (unsigned)item.kind);
     }
     return NULL;
 }
@@ -3935,30 +4456,54 @@ static bool dispatch_graphics_inner(Ctx *context, uint64_t address);
 static bool dispatch_graphics(Ctx *context, uint64_t address)
 {
 #ifndef _WIN32
-    const uint64_t start = stat_now_ns();
-    const char *const outer_name = stat_call_name; /* R89: a nested call (memory callback) keeps the outer name */
-    stat_call_name = NULL;
+    /* R94: every guest indirect call (the game's virtual calls on all its
+     * threads) comes here first. Rule out non-graphics targets before the
+     * timing and per-thread bookkeeping below (emulated TLS reads, a TSC
+     * read, two atomic stores per call). */
+    if (nvn && address != POKOPIA_NV_INITIALIZE && address != POKOPIA_NV_INITIALIZE_DEFAULT &&
+        address != POKOPIA_NV_INITIALIZE_DEVTOOLS && !vi_adapter_may_own(&vi, address) &&
+        !nvn_front_may_own(nvn, address))
+        return false;
+    /* R94: per-call timing (the "Graphics stats top" line) only when debug
+     * flags bit 15 is clear; its emulated-TLS reads and TSC reads were most of
+     * the dispatcher's own time on the render thread. */
+    const unsigned flags = pokopia_debug_flags;
+    const bool timing = !(flags & POKOPIA_DEBUG_NO_NVN_TIMING);
+    unsigned weight = 1;
+    bool timed = false;
+    uint64_t start = 0;
+    const char *outer_name = NULL;
+    if (timing) {
+        static _Thread_local uint64_t graphics_timing_iteration;
+        weight = (flags & POKOPIA_DEBUG_SAMPLE_NVNS) && !memory_callback_depth ? 16u : 1u;
+        timed = weight == 1 || pokopia_timing_sample(graphics_timing_iteration++);
+        start = timed ? stat_now_ns() : 0;
+        outer_name = stat_call_name; /* R89: a nested call (memory callback) keeps the outer name */
+        stat_call_name = NULL;
+    }
 #if defined(__PROSPERO__)
-    if (stat_thread)
-        atomic_store_explicit(&stat_thread->in_host, 1, memory_order_relaxed);
+    StatThread *const host_stats = stat_thread;
+    if (host_stats)
+        atomic_store_explicit(&host_stats->in_host, 1, memory_order_relaxed);
 #endif
     const bool handled = dispatch_graphics_inner(context, address);
 #if defined(__PROSPERO__)
-    if (stat_thread)
-        atomic_store_explicit(&stat_thread->in_host, 0, memory_order_relaxed);
+    if (host_stats)
+        atomic_store_explicit(&host_stats->in_host, 0, memory_order_relaxed);
 #endif
-    if (handled) {
+    if (handled && timed) {
         const uint64_t ns = stat_now_ns() - start;
-        STAT_ADD(stat_nvn_calls, 1);
-        STAT_ADD(stat_nvn_ns, ns);
-        stat_charge_name(ns);
+        STAT_ADD(stat_nvn_calls, weight);
+        STAT_ADD(stat_nvn_ns, ns * weight);
+        stat_charge_name(ns, weight);
         if (memory_callback_depth && ns > UINT64_C(2000000)) {
             fprintf(probe_log, "NVN memory callback inner call %s took %.1f ms\n",
                     stat_call_name ? stat_call_name : "(unnamed)", ns * 1e-6);
             fflush(probe_log);
         }
     }
-    stat_call_name = outer_name;
+    if (timing)
+        stat_call_name = outer_name;
     /* R60: a paced loading-screen present sleeps here, after the global lock
      * is released, so the loading threads get that time instead. */
     if (present_pace_until) {
@@ -4134,11 +4679,14 @@ static bool dispatch_graphics_inner(Ctx *context, uint64_t address)
         uint64_t object = context->x[0];
         /* R78: a call the replay handled before goes straight there; the
          * window and frame-control name chains cost ~20 strcmp a call. */
+        /* A failed proc lookup can name the requested procedure in the reply.
+         * Cache only the static key for the actual dispatched procedure. */
+        const char *static_key = reply.key == call_name ? call_name : NULL;
         static const char *replay_names[256];
         const size_t route = (size_t)(((uintptr_t)reply.key >> 3) * UINT64_C(0x9e3779b97f4a7c15) >> 56);
         NvnFrontReplyKind window_reply = NVN_FRONT_NOT_OURS;
         if (reply.key && replay_names[route] == reply.key) {
-            reply.kind = dispatch_nvn_replay(context, reply.name, scalar);
+            reply.kind = dispatch_nvn_replay(context, reply.name, static_key, scalar);
             if (reply.kind == NVN_FRONT_NOT_OURS)
                 reply.kind = NVN_FRONT_BOUNDARY;
         } else if ((window_reply = nvn_window_dispatch(windows, reply.name, context->x)) != NVN_FRONT_NOT_OURS)
@@ -4148,7 +4696,7 @@ static bool dispatch_graphics_inner(Ctx *context, uint64_t address)
             if (frame_reply != NVN_FRONT_NOT_OURS)
                 reply.kind = frame_reply;
             else {
-                NvnFrontReplyKind replay_reply = dispatch_nvn_replay(context, reply.name, scalar);
+                NvnFrontReplyKind replay_reply = dispatch_nvn_replay(context, reply.name, static_key, scalar);
                 if (replay_reply != NVN_FRONT_NOT_OURS) {
                     reply.kind = replay_reply;
                     if (reply.key && !strncmp(reply.key, "nvnCommandBuffer", 16))
@@ -5360,12 +5908,57 @@ void guest_svc(Ctx *context, uint32_t number)
         atomic_store_explicit(&stat_thread->in_svc, (int)(number < STAT_SVCS ? number : STAT_SVCS - 1) + 1,
                               memory_order_relaxed);
 #endif
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX)
+    const unsigned phase = number == 0x0b || number == 0x1c || number == 0x1d ? frame_trace_active() : 0;
+    const uint64_t trace_tid = phase ? pokopia_trace_guest_tid() : 0;
+    const bool trace_sleep = number == 0x0b && trace_tid == 1;
+    const bool trace_render_wait = number == 0x1c && trace_tid == 24;
+    const bool trace_worker_wait = number == 0x1c && trace_tid >= 4 && trace_tid <= 8;
+    const uint64_t sleep_request = trace_sleep ? context->x[0] : 0;
+    /* Keep the worker capture active after the short frame-trace buffer fills. */
+    const bool profile_sleep = number == 0x0b && context->x[0] == UINT64_C(1000000) &&
+        (pokopia_debug_flags & POKOPIA_DEBUG_FRAME_TRACE) &&
+        !atomic_load_explicit(&wait_work_finished, memory_order_relaxed) && pokopia_trace_guest_tid() == 1;
+    const uint64_t sleep_caller = trace_sleep || profile_sleep ? trace_sleep_caller(context) : 0;
+    const bool profile_gate = profile_sleep && sleep_caller == UINT64_C(0x71008832b0);
+    const uint64_t wait_key = trace_render_wait || trace_worker_wait ? context->x[1] : 0;
+    if (trace_render_wait)
+        atomic_store_explicit(&trace_render_wait_key, wait_key, memory_order_release);
+    const uint64_t signal_key = phase && number == 0x1d && context->x[0] &&
+        context->x[0] == atomic_load_explicit(&trace_render_wait_key, memory_order_acquire) ? context->x[0] : 0;
+    const uint64_t caller = trace_sleep || trace_render_wait || signal_key ? context->x[30] : 0;
+    const uint64_t sleep_fn = trace_sleep ? context->fn : 0;
+    if (profile_gate)
+        atomic_store_explicit(&wait_work_gate, start, memory_order_release);
+#endif
     guest_svc_inner(context, number);
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX)
+    if (profile_gate)
+        atomic_store_explicit(&wait_work_gate, 0, memory_order_release);
+#endif
 #if defined(__PROSPERO__)
     if (stat_thread)
         atomic_store_explicit(&stat_thread->in_svc, 0, memory_order_relaxed);
 #endif
     const uint64_t end = stat_now_ns();
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX)
+    if (trace_render_wait)
+        atomic_store_explicit(&trace_render_wait_key, 0, memory_order_release);
+    if (phase && phase == frame_trace_active()) {
+        if (trace_sleep) {
+            frame_trace("sleep", start, sleep_request, end - start);
+            frame_trace("sleep-site", start, sleep_caller, sleep_request);
+            if ((sleep_caller >> 32) != 0x71)
+                frame_trace("sleep-raw", start, caller, sleep_fn);
+        }
+        if (trace_render_wait || (trace_worker_wait && end - start >= UINT64_C(300000)))
+            frame_trace("cond-wait", start, wait_key, end - start);
+        if (trace_render_wait)
+            frame_trace("cond-site", start, wait_key, caller);
+        if (signal_key && context->x[0] == 0)
+            frame_trace("cond-signal", start, signal_key, caller);
+    }
+#endif
     const unsigned slot = number < STAT_SVCS ? number : STAT_SVCS - 1;
     STAT_ADD(stat_svc_calls[slot], 1);
     STAT_ADD(stat_svc_ns[slot], end - start);
@@ -6106,6 +6699,10 @@ int pokopia_guest_probe(FILE *log)
         .allocate_tls = allocate_thread_tls,
         .release_tls = release_thread_tls,
         .dispatch = dispatch_thread,
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX)
+        .use_precise_main_sleep = use_precise_main_sleep,
+        .precise_sleep_clock = stat_now_ns,
+#endif
 #if defined(POKOPIA_GFX) && !defined(_WIN32)
         .direct_worker_stacks = true,
         .worker_error = report_worker_error,

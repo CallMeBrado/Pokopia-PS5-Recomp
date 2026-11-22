@@ -238,6 +238,7 @@ typedef struct CommandBuffer {
 
 typedef struct Program {
     struct Program *next;
+    struct Program *bucket_next; /* R94: chain in NvnFront.program_buckets */
     uint64_t address;
     NvnFrontProgramInfo info;
 } Program;
@@ -260,6 +261,9 @@ struct NvnFront {
      * when it is unlinked. */
     Texture *texture_cache[8192];
     Program *program_cache[16384];
+    /* R94: every program by address hash. A cache miss walked the whole
+     * program list: ~14% of the render thread's host time while turning. */
+    Program *program_buckets[4096];
     uint64_t program_misses[512]; /* R76: addresses known not to be programs (+1) */
     Buffer *buffer_cache[8192]; /* R74: same for buffers */
     Texture *texture_buckets[16384]; /* R80 */
@@ -436,7 +440,9 @@ static Program *lookup_program(NvnFront *front, uint64_t address)
     uint64_t *miss = &front->program_misses[cache_slot(address, sizeof front->program_misses / sizeof *miss)];
     if (*miss == address + 1)
         return NULL;
-    Program *program = *find_program(&front->programs, address);
+    Program *program = front->program_buckets[cache_slot(address, 4096)];
+    while (program && program->address != address)
+        program = program->bucket_next;
     if (program)
         *slot = program;
     else
@@ -2128,6 +2134,12 @@ static void remove_program(NvnFront *front, Program **link)
 {
     Program *program = *link;
     *link = program->next;
+    for (Program **bucket = &front->program_buckets[cache_slot(program->address, 4096)]; *bucket;
+         bucket = &(*bucket)->bucket_next)
+        if (*bucket == program) {
+            *bucket = program->bucket_next;
+            break;
+        }
     forget_program(front, program);
     front->config.program_destroy(front->config.backend_opaque, program->info.native);
     free(program);
@@ -2157,6 +2169,9 @@ static NvnFrontReplyKind initialize_program(NvnFront *front, uint64_t x[32])
     program->info.device = x[1];
     program->next = *link;
     *link = program;
+    Program **bucket = &front->program_buckets[cache_slot(program->address, 4096)];
+    program->bucket_next = *bucket;
+    *bucket = program;
     memset(front->program_misses, 0, sizeof front->program_misses);
     /* The backend tracks the device's program list independently of the SDK. */
     memset(object, 0, PROGRAM_BYTES);

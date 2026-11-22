@@ -375,6 +375,36 @@ static int ps5_get_thread_cpus(cpuset_t *set, size_t *used)
     return err;
 }
 
+void hzn_thread_test_affinity(unsigned cpu_rank, bool enabled)
+{
+    static _Thread_local cpuset_t original;
+    static _Thread_local size_t bytes;
+    static _Thread_local bool requested, selected;
+    if (enabled == requested)
+        return;
+    requested = enabled;
+    if (enabled) {
+        if (ps5_get_thread_cpus(&original, &bytes) != 0 || (unsigned)CPU_COUNT(&original) <= cpu_rank)
+            return;
+        cpuset_t chosen;
+        CPU_ZERO(&chosen);
+        unsigned rank = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &original) && rank++ == cpu_rank) {
+                CPU_SET(cpu, &chosen);
+                break;
+            }
+        }
+        const int rc = pthread_setaffinity_np(pthread_self(), bytes, &chosen);
+        ps5_sched_log("benchmark rank=%u mask=%#llx set rc=%d\n", cpu_rank, ps5_cpuset_bits(&chosen), rc);
+        selected = rc == 0;
+    } else if (selected) {
+        const int rc = pthread_setaffinity_np(pthread_self(), bytes, &original);
+        ps5_sched_log("benchmark rank=%u restored mask=%#llx rc=%d\n", cpu_rank, ps5_cpuset_bits(&original), rc);
+        selected = rc != 0;
+    }
+}
+
 static void ps5_sched_init(void)
 {
     cpuset_t process, self;
@@ -730,18 +760,41 @@ static uint64_t sleep_clock_ns(void)
 }
 
 static void sleep_thread_inner(HznThreads *threads, int64_t ns);
-static void sleep_thread(HznThreads *threads, int64_t ns)
+static bool precise_main_sleep(HznThreads *threads, bool main, int64_t ns)
+{
+#if defined(__PROSPERO__)
+    const HznThreadConfig *config = &threads->config;
+    if (main && ns > 0 && ns <= 1000000 && !threads->closing && config->precise_sleep_clock &&
+        config->use_precise_main_sleep && config->use_precise_main_sleep()) {
+        const uint64_t deadline = config->precise_sleep_clock() + (uint64_t)ns;
+        unlock(threads);
+        while (config->precise_sleep_clock() < deadline)
+            __builtin_ia32_pause();
+        lock(threads);
+        return true;
+    }
+#else
+    (void)threads;
+    (void)main;
+    (void)ns;
+#endif
+    return false;
+}
+
+static void sleep_thread(HznThreads *threads, bool main, int64_t ns)
 {
     const uint64_t start = sleep_clock_ns();
+    if (!precise_main_sleep(threads, main, ns)) {
 #if defined(__PROSPERO__) && defined(POKOPIA_FAST_SHORT_SLEEP)
-    /* R71 experiment (off): short polls wake after a quarter of the request.
-     * It did not shorten startup (r71a: same read rate, gameplay at 225 s vs
-     * 235 s), so the first loading screen is not paced by 1 ms polls. */
-    const int64_t slept = ns > 0 && ns <= 1000000 ? (ns / 4 > 50000 ? ns / 4 : 50000) : ns;
-    sleep_thread_inner(threads, slept);
+        /* R71 experiment (off): short polls wake after a quarter of the request.
+         * It did not shorten startup (r71a: same read rate, gameplay at 225 s vs
+         * 235 s), so the first loading screen is not paced by 1 ms polls. */
+        const int64_t slept = ns > 0 && ns <= 1000000 ? (ns / 4 > 50000 ? ns / 4 : 50000) : ns;
+        sleep_thread_inner(threads, slept);
 #else
-    sleep_thread_inner(threads, ns);
+        sleep_thread_inner(threads, ns);
 #endif
+    }
     const unsigned bucket = ns <= 0 ? 0 : ns <= 1000000 ? 1 : ns <= 4000000 ? 2 : ns <= 17000000 ? 3 : 4;
     ++hzn_sleep_stats[bucket][0];
     hzn_sleep_stats[bucket][1] += ns > 0 ? (uint64_t)ns : 0;
@@ -874,7 +927,7 @@ bool hzn_thread_svc(HznThreads *threads, Ctx *ctx, uint32_t number)
                 }
             }
         }
-        sleep_thread(threads, (int64_t)ctx->x[0]);
+        sleep_thread(threads, main, (int64_t)ctx->x[0]);
         if (caller && threads->closing) {
             unlock(threads);
             exit_worker(caller);

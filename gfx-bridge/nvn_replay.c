@@ -157,7 +157,7 @@ typedef struct Recording {
     bool polygon_offset_fill; /* R73 */
     uint32_t target_count;
     /* R65: operations are kept as the same compact byte stream a recorded list
-     * uses (one kind byte, then that kind's payload) instead of an array of
+     * uses (kind byte, optional alignment padding, payload) instead of an array of
      * full-size Operation unions (~1.7 KiB each, even for a fence). At
      * EndRecording the stream becomes the list without another copy. R64
      * stopped when one long recording failed to double that array. */
@@ -173,8 +173,7 @@ typedef struct RecordedList {
     /* R63: bytes held and the last submit, for the bounded list cache. */
     size_t bytes;
     uint64_t last_use;
-    /* Each operation is a one-byte kind followed by its payload. R65: owned
-     * pointer handed over from the recording's stream. */
+    /* R65: owned stream handed over from the recording. */
     uint8_t *operations;
     unsigned pinned; /* R76: executing; never evicted or freed meanwhile */
     size_t capacity; /* R78: bytes allocated for operations */
@@ -236,7 +235,34 @@ static size_t operation_payload_size(OperationKind kind)
 
 _Static_assert(OP_COPY_TEXTURE <= UINT8_MAX, "recorded operation kind must fit in one byte");
 
+/* Only draws need aligned payloads. The replay reads those directly and keeps
+ * the smaller command types packed. malloc and realloc align the stream base. */
+static size_t operation_data_offset(size_t kind_offset, OperationKind kind)
+{
+    const size_t start = kind_offset + 1;
+    const size_t mask = _Alignof(Draw) - 1;
+    return kind == OP_DRAW ? (start + mask) & ~mask : start;
+}
+
+typedef enum {
+    HOT_OTHER,
+    HOT_DRAW_BASE_VERTEX,
+    HOT_BIND_VERTEX,
+    HOT_BIND_UNIFORM,
+    HOT_BIND_TEXTURE,
+    HOT_BIND_PROGRAM,
+    HOT_BIND_ATTRIB_STATE,
+    HOT_BIND_STREAM_STATE,
+    HOT_DRAW_INSTANCED,
+} HotReplayCommand;
+
+typedef struct {
+    const char *key;
+    HotReplayCommand command;
+} ReplayDispatchEntry;
+
 struct NvnReplay {
+    ReplayDispatchEntry dispatch_cache[256];
     NvnReplayConfig config;
     Recording *recordings;
     RecordedList *lists;
@@ -445,6 +471,9 @@ static NvnFrontReplyKind begin_recording(NvnReplay *replay, uint64_t encoder)
     memset(recording->stencil[STENCIL_WRITE_MASK], 0xff, sizeof recording->stencil[STENCIL_WRITE_MASK]);
     recording->next = replay->recordings;
     replay->recordings = recording;
+#if defined(__PROSPERO__)
+    pokopia_trace_producer("rec-open", 0, encoder, 0);
+#endif
     return NVN_FRONT_HANDLED;
 }
 
@@ -462,12 +491,13 @@ static bool resolve_copy(NvnReplay *replay, uint64_t device, Copy copy, const vo
 
 static void evict_lists_for_heap(NvnReplay *replay);
 
-static bool append_operation(NvnReplay *replay, Recording *recording, Operation operation)
+static bool append_operation(NvnReplay *replay, Recording *recording, const Operation *operation)
 {
-    const size_t payload = operation_payload_size(operation.kind);
+    const size_t payload = operation_payload_size(operation->kind);
     if (!payload)
         return false;
-    const size_t need = 1 + payload;
+    const size_t data_offset = operation_data_offset(recording->used, operation->kind);
+    const size_t need = data_offset - recording->used + payload;
     if (!recording->stream) {
         size_t pooled = 0;
         uint8_t *data = stream_take(need, &pooled);
@@ -498,8 +528,9 @@ static bool append_operation(NvnReplay *replay, Recording *recording, Operation 
         recording->stream = stream;
         recording->capacity = capacity;
     }
-    recording->stream[recording->used] = (uint8_t)operation.kind;
-    memcpy(recording->stream + recording->used + 1, &operation.data, payload);
+    recording->stream[recording->used] = (uint8_t)operation->kind;
+    const void *data = operation->kind == OP_DRAW ? (const void *)&operation->data.draw : &operation->data;
+    memcpy(recording->stream + data_offset, data, payload);
     recording->used += need;
     recording->last_size = need;
     ++recording->count;
@@ -522,7 +553,7 @@ static bool charge_recording(NvnReplay *replay, Recording *recording, size_t com
     return true;
 }
 
-static NvnFrontReplyKind append_metered(NvnReplay *replay, Recording *recording, Operation operation,
+static NvnFrontReplyKind append_metered(NvnReplay *replay, Recording *recording, const Operation *operation,
                                        size_t command_bytes, size_t control_bytes)
 {
     if (!append_operation(replay, recording, operation))
@@ -554,9 +585,9 @@ static NvnFrontReplyKind record_copy(NvnReplay *replay, const uint64_t x[32])
         return NVN_FRONT_INVALID_GUEST;
     Operation operation = { .kind = OP_COPY, .data.copy = copy };
     if (command.recording_mode == 1 || command.recording_mode == 4)
-        return append_metered(replay, recording, operation, 0, 32);
+        return append_metered(replay, recording, &operation, 0, 32);
     const size_t packets = (copy.size - 1) / 0x3fffff + 1;
-    return append_metered(replay, recording, operation, 36 * packets + (command.recording_mode <= 4 ? 8 : 0), 0);
+    return append_metered(replay, recording, &operation, 36 * packets + (command.recording_mode <= 4 ? 8 : 0), 0);
 }
 
 static CounterReport *resolve_counter_report(const NvnReplayConfig *config, uint64_t device, uint64_t address)
@@ -579,7 +610,7 @@ static NvnFrontReplyKind record_timestamp(NvnReplay *replay, const uint64_t x[32
         return NVN_FRONT_INVALID_GUEST;
     const Operation operation = { .kind = OP_TIMESTAMP, .data.timestamp_address = x[2] };
     /* A report semaphore packet carries four words after the method header. */
-    const NvnFrontReplyKind result = append_metered(replay, recording, operation, 20, 0);
+    const NvnFrontReplyKind result = append_metered(replay, recording, &operation, 20, 0);
     if (result != NVN_FRONT_BOUNDARY || replay->memory_request.function)
         return result; /* recorded, or the loader will grow command memory and retry */
     /* R62: R61 stopped here with no memory request pending. A timestamp only
@@ -1508,7 +1539,7 @@ static NvnFrontReplyKind record_clear(NvnReplay *replay, const uint64_t x[32])
     const uint32_t command_bytes = command.recording_mode <= 4 ? 56 : 48;
     if (!area.extent.width || !area.extent.height)
         return charge_recording(replay, recording, command_bytes, 0) ? NVN_FRONT_HANDLED : NVN_FRONT_BOUNDARY;
-    return append_metered(replay, recording, operation, command_bytes, 0);
+    return append_metered(replay, recording, &operation, command_bytes, 0);
 }
 
 static VkRect2D clear_area(const Recording *recording, const NvnFrontTextureConfig *config)
@@ -1643,7 +1674,7 @@ static NvnFrontReplyKind record_copy_texture(NvnReplay *replay, const uint64_t x
     copy->source_native = from->texture.native;
     copy->destination_native = to->texture.native;
     copy->copy.linear = (flags & COPY_LINEAR_FILTER) != 0;
-    return append_metered(replay, recording, operation, command_bytes, control_bytes);
+    return append_metered(replay, recording, &operation, command_bytes, control_bytes);
 }
 
 static NvnFrontReplyKind run_copy_texture(NvnReplay *replay, const TextureCopy *recorded, bool execute)
@@ -1728,7 +1759,7 @@ static NvnFrontReplyKind record_depth_clear_strict(NvnReplay *replay, const uint
         .address = recording->depth_target, .native = texture.native,
         .area = area, .aspects = aspects, .value = {depth, (uint32_t)x[2] & 0xff},
     }};
-    return append_metered(replay, recording, operation, 0, 24);
+    return append_metered(replay, recording, &operation, 0, 24);
 }
 
 static bool valid_stencil_enum(uint32_t value)
@@ -1908,7 +1939,7 @@ static NvnFrontReplyKind record_draw_general(NvnReplay *replay, const uint64_t x
     state->instance_count = instanced ? (uint32_t)x[7] : 1;
     state->first_instance = instanced ? (uint32_t)x[6] : 0;
     const size_t bytes = !indexed ? 16 : !base_vertex ? 24 : (state->base_vertex ? 72 : 48);
-    return append_metered(replay, r, operation, bytes, 0);
+    return append_metered(replay, r, &operation, bytes, 0);
 }
 
 static NvnFrontReplyKind record_draw(NvnReplay *replay, const uint64_t x[32], bool indexed,
@@ -2036,9 +2067,9 @@ static NvnFrontReplyKind record_draw_strict(NvnReplay *replay, const uint64_t x[
     fallback->cull = r->cull;
     fallback->depth_func = r->depth_func;
     if (!indexed)
-        return append_metered(replay, r, operation, 16, 0);
+        return append_metered(replay, r, &operation, 16, 0);
     const size_t bytes = !base_vertex ? 24 : (operation.data.draw.state.base_vertex ? 72 : 48);
-    return append_metered(replay, r, operation, bytes, 0);
+    return append_metered(replay, r, &operation, bytes, 0);
 }
 
 static NvnFrontReplyKind record_dispatch_strict(NvnReplay *replay, const uint64_t x[32]);
@@ -2107,7 +2138,7 @@ static NvnFrontReplyKind record_dispatch_strict(NvnReplay *replay, const uint64_
         }
         for (unsigned i = 0; i < COMPUTE_STORAGE_SLOTS; ++i)
             d->ssbo[i] = r->compute_storage[i];
-        return append_metered(replay, r, operation, 0, 16);
+        return append_metered(replay, r, &operation, 0, 16);
     }
     const size_t cluster_bytes = pokopia_cluster_output_bytes(groups);
     if (abi == COMPUTE_UNSUPPORTED ||
@@ -2122,7 +2153,7 @@ static NvnFrontReplyKind record_dispatch_strict(NvnReplay *replay, const uint64_
         .groups = {groups[0], groups[1], groups[2]},
     }};
     /* SDK 0x60d9c0 emits a 16-byte dispatch control record. */
-    return append_metered(replay, r, operation, 0, 16);
+    return append_metered(replay, r, &operation, 0, 16);
 }
 
 static PokopiaLiveDrawSpan draw_span(const NvnReplayConfig *config, uint64_t device, BufferRange range)
@@ -3081,7 +3112,7 @@ static NvnFrontReplyKind record_sync(NvnReplay *replay, const uint64_t x[32], bo
     if (!wait && ((uint32_t)x[2] || (uint32_t)x[3] > 1))
         return NVN_FRONT_BOUNDARY;
     Operation operation = {.kind = OP_SYNC, .data.sync = {x[1], sync, wait}};
-    return append_metered(replay, r, operation, 0, 16);
+    return append_metered(replay, r, &operation, 0, 16);
 }
 
 static bool resolve_compute_texel(const NvnReplayConfig *config, uint64_t device, uint64_t pool,
@@ -3503,6 +3534,9 @@ static NvnFrontReplyKind end_recording(NvnReplay *replay, uint64_t x[32])
     remove_recording(link);
     replay->lists = list;
     replay->next_handle += 8;
+#if defined(__PROSPERO__)
+    pokopia_trace_producer("rec-seal", 0, x[0], list->handle);
+#endif
     x[0] = list->handle;
     return NVN_FRONT_HANDLED;
 }
@@ -3521,21 +3555,34 @@ static uint64_t replay_now_ns(void)
 
 static NvnFrontReplyKind run_list(NvnReplay *replay, uint64_t device, const RecordedList *list, bool execute)
 {
-    const uint8_t *cursor = list->operations;
+    size_t offset = 0;
     for (size_t i = 0; i < list->count; ++i) {
-        Operation operation;
-        operation.kind = (OperationKind)*cursor++;
-        const size_t payload = operation_payload_size(operation.kind);
+        const OperationKind kind = (OperationKind)list->operations[offset];
+        const size_t payload = operation_payload_size(kind);
         if (!payload)
             return NVN_FRONT_BOUNDARY;
-        memcpy(&operation.data, cursor, payload);
-        cursor += payload;
-        const uint64_t op_start = replay_now_ns();
-        const NvnFrontReplyKind result = run_operation(replay, device, &operation, execute);
-        if ((unsigned)operation.kind < 8) {
-            nvn_replay_op_ns[operation.kind][execute] += replay_now_ns() - op_start;
-            ++nvn_replay_op_calls[operation.kind][execute];
+        const size_t data_offset = operation_data_offset(offset, kind);
+        const uint8_t *data = list->operations + data_offset;
+        offset = data_offset + payload;
+        const unsigned flags = pokopia_debug_flags;
+        const bool draw = kind == OP_DRAW;
+        const bool counted = (unsigned)kind < 8;
+        const unsigned weight = (flags & POKOPIA_DEBUG_SAMPLE_DRAWS) && draw ? 16u : 1u;
+        const bool timed = counted && (weight == 1 || pokopia_timing_sample(nvn_replay_op_calls[kind][execute]));
+        const uint64_t op_start = timed ? replay_now_ns() : 0;
+        NvnFrontReplyKind result;
+        if (draw && (flags & (1u << 21))) {
+            result = run_draw(replay, device, (const Draw *)data, execute);
+        } else {
+            Operation operation;
+            operation.kind = kind;
+            memcpy(&operation.data, data, payload);
+            result = run_operation(replay, device, &operation, execute);
         }
+        if (timed)
+            nvn_replay_op_ns[kind][execute] += (replay_now_ns() - op_start) * weight;
+        if (counted)
+            ++nvn_replay_op_calls[kind][execute];
         if (result != NVN_FRONT_HANDLED)
             return result;
         if (execute && replay->config.execute_yield)
@@ -3559,7 +3606,18 @@ struct NvnReplayJob {
     uint64_t device;
     uint32_t count;
     const RecordedList **batch;
+    uint64_t submit_start;
 };
+
+#if defined(__PROSPERO__)
+void nvn_replay_trace_submission(const NvnReplayJob *job, uint64_t seq)
+{
+    pokopia_trace_producer("submit-start", job->submit_start, seq, 0);
+    for (uint32_t i = 0; i < job->count; ++i)
+        if (job->batch[i])
+            pokopia_trace_producer("job-list", 0, seq, job->batch[i]->handle);
+}
+#endif
 
 static NvnFrontReplyKind run_job(NvnReplay *replay, NvnReplayJob *job);
 
@@ -3605,7 +3663,7 @@ static NvnFrontReplyKind submit(NvnReplay *replay, uint64_t device, uint32_t cou
     if (config->enqueue) {
         NvnReplayJob *job = malloc(sizeof *job);
         if (job) {
-            *job = (NvnReplayJob){device, count, batch};
+            *job = (NvnReplayJob){device, count, batch, submit_start};
             if (config->enqueue(config->opaque, job)) {
                 nvn_replay_submit_ns += replay_now_ns() - submit_start;
                 return NVN_FRONT_HANDLED;
@@ -3614,7 +3672,7 @@ static NvnFrontReplyKind submit(NvnReplay *replay, uint64_t device, uint32_t cou
         }
     }
     {
-        NvnReplayJob job = {device, count, batch};
+        NvnReplayJob job = {device, count, batch, submit_start};
         nvn_replay_submit_ns += replay_now_ns() - submit_start;
         return run_job(replay, &job);
     }
@@ -3662,24 +3720,71 @@ NvnFrontReplyKind nvn_replay_run_job(NvnReplay *replay, NvnReplayJob *job)
     return result;
 }
 
-NvnFrontReplyKind nvn_replay_dispatch(NvnReplay *replay, const char *name, uint64_t x[32],
-                                     const uint32_t float_args[3])
+static HotReplayCommand lookup_hot_command(NvnReplay *replay, const char *key)
+{
+    static const char *const names[] = {
+        [HOT_DRAW_BASE_VERTEX] = "nvnCommandBufferDrawElementsBaseVertex",
+        [HOT_BIND_VERTEX] = "nvnCommandBufferBindVertexBuffer",
+        [HOT_BIND_UNIFORM] = "nvnCommandBufferBindUniformBuffer",
+        [HOT_BIND_TEXTURE] = "nvnCommandBufferBindTexture",
+        [HOT_BIND_PROGRAM] = "nvnCommandBufferBindProgram",
+        [HOT_BIND_ATTRIB_STATE] = "nvnCommandBufferBindVertexAttribState",
+        [HOT_BIND_STREAM_STATE] = "nvnCommandBufferBindVertexStreamState",
+        [HOT_DRAW_INSTANCED] = "nvnCommandBufferDrawElementsInstanced",
+    };
+    const uint64_t hash = ((uintptr_t)key >> 3) * UINT64_C(0x9e3779b97f4a7c15);
+    ReplayDispatchEntry *entry = &replay->dispatch_cache[hash >> 56];
+    if (entry->key == key)
+        return entry->command;
+    HotReplayCommand command = HOT_OTHER;
+    for (size_t i = 1; i < sizeof names / sizeof names[0]; ++i) {
+        if (!strcmp(key, names[i])) {
+            command = (HotReplayCommand)i;
+            break;
+        }
+    }
+    *entry = (ReplayDispatchEntry){key, command};
+    return command;
+}
+
+static inline NvnFrontReplyKind dispatch_hot_command(NvnReplay *replay, uint64_t x[32], HotReplayCommand command)
+{
+    switch (command) {
+    case HOT_DRAW_BASE_VERTEX: return record_draw(replay, x, true, true, false);
+    case HOT_BIND_VERTEX: return bind_buffers(replay, x, false, false);
+    case HOT_BIND_UNIFORM: return bind_buffers(replay, x, true, false);
+    case HOT_BIND_TEXTURE: return bind_texture(replay, x);
+    case HOT_BIND_PROGRAM: return bind_program(replay, x);
+    case HOT_BIND_ATTRIB_STATE: return bind_vertex_state(replay, x, false);
+    case HOT_BIND_STREAM_STATE: return bind_vertex_state(replay, x, true);
+    case HOT_DRAW_INSTANCED: return record_draw(replay, x, true, true, true);
+    default: return NVN_FRONT_NOT_OURS;
+    }
+}
+
+NvnFrontReplyKind nvn_replay_dispatch_keyed(NvnReplay *replay, const char *name, const char *static_key,
+                                           uint64_t x[32], const uint32_t float_args[3])
 {
     if (!replay || !name || !x)
         return NVN_FRONT_NOT_OURS;
     nvn_replay_boundary_reason = NULL;
     replay->memory_request = (NvnReplayMemoryRequest){0};
+    if (static_key) {
+        const HotReplayCommand command = lookup_hot_command(replay, static_key);
+        if (command != HOT_OTHER)
+            return dispatch_hot_command(replay, x, command);
+    }
     /* R78: the most frequent recording calls first (draws sat ~45 compares down). */
     if (!strcmp(name, "nvnCommandBufferDrawElementsBaseVertex"))
-        return record_draw(replay, x, true, true, false);
+        return dispatch_hot_command(replay, x, HOT_DRAW_BASE_VERTEX);
     if (!strcmp(name, "nvnCommandBufferBindVertexBuffer"))
-        return bind_buffers(replay, x, false, false);
+        return dispatch_hot_command(replay, x, HOT_BIND_VERTEX);
     if (!strcmp(name, "nvnCommandBufferBindUniformBuffer"))
-        return bind_buffers(replay, x, true, false);
+        return dispatch_hot_command(replay, x, HOT_BIND_UNIFORM);
     if (!strcmp(name, "nvnCommandBufferBindTexture"))
-        return bind_texture(replay, x);
+        return dispatch_hot_command(replay, x, HOT_BIND_TEXTURE);
     if (!strcmp(name, "nvnCommandBufferBindProgram"))
-        return bind_program(replay, x);
+        return dispatch_hot_command(replay, x, HOT_BIND_PROGRAM);
     if (!strcmp(name, "nvnCommandBufferBeginRecording"))
         return begin_recording(replay, x[0]);
     if (!strcmp(name, "nvnCommandBufferCopyBufferToBuffer"))
@@ -3697,21 +3802,21 @@ NvnFrontReplyKind nvn_replay_dispatch(NvnReplay *replay, const char *name, uint6
     if (!strcmp(name, "nvnCommandBufferSetSamplerPool"))
         return set_descriptor_pool(replay, x, true);
     if (!strcmp(name, "nvnCommandBufferBindProgram"))
-        return bind_program(replay, x);
+        return dispatch_hot_command(replay, x, HOT_BIND_PROGRAM);
     if (!strcmp(name, "nvnCommandBufferBindImage"))
         return bind_image(replay, x);
     if (!strcmp(name, "nvnCommandBufferBindTexture"))
-        return bind_texture(replay, x);
+        return dispatch_hot_command(replay, x, HOT_BIND_TEXTURE);
     if (!strcmp(name, "nvnCommandBufferBindVertexBuffer"))
-        return bind_buffers(replay, x, false, false);
+        return dispatch_hot_command(replay, x, HOT_BIND_VERTEX);
     if (!strcmp(name, "nvnCommandBufferBindVertexBuffers"))
         return bind_buffers(replay, x, false, true);
     if (!strcmp(name, "nvnCommandBufferBindVertexAttribState"))
-        return bind_vertex_state(replay, x, false);
+        return dispatch_hot_command(replay, x, HOT_BIND_ATTRIB_STATE);
     if (!strcmp(name, "nvnCommandBufferBindVertexStreamState"))
-        return bind_vertex_state(replay, x, true);
+        return dispatch_hot_command(replay, x, HOT_BIND_STREAM_STATE);
     if (!strcmp(name, "nvnCommandBufferBindUniformBuffer"))
-        return bind_buffers(replay, x, true, false);
+        return dispatch_hot_command(replay, x, HOT_BIND_UNIFORM);
     if (!strcmp(name, "nvnCommandBufferBindUniformBuffers"))
         return bind_buffers(replay, x, true, true);
     if (!strcmp(name, "nvnCommandBufferBindStorageBuffer"))
@@ -3761,9 +3866,9 @@ NvnFrontReplyKind nvn_replay_dispatch(NvnReplay *replay, const char *name, uint6
     if (!strcmp(name, "nvnCommandBufferDrawElements"))
         return record_draw(replay, x, true, false, false);
     if (!strcmp(name, "nvnCommandBufferDrawElementsBaseVertex"))
-        return record_draw(replay, x, true, true, false);
+        return dispatch_hot_command(replay, x, HOT_DRAW_BASE_VERTEX);
     if (!strcmp(name, "nvnCommandBufferDrawElementsInstanced"))
-        return record_draw(replay, x, true, true, true);
+        return dispatch_hot_command(replay, x, HOT_DRAW_INSTANCED);
     if (!strcmp(name, "nvnCommandBufferDrawArraysIndirect") ||
         !strcmp(name, "nvnCommandBufferDrawElementsIndirect")) {
         /* R75: the world issues indirect draws (first seen DrawArraysIndirect
@@ -3813,4 +3918,8 @@ NvnFrontReplyKind nvn_replay_dispatch(NvnReplay *replay, const char *name, uint6
     return !finish || replay->config.finish(replay->config.opaque) ? NVN_FRONT_HANDLED : NVN_FRONT_BOUNDARY;
 }
 
-
+NvnFrontReplyKind nvn_replay_dispatch(NvnReplay *replay, const char *name, uint64_t x[32],
+                                     const uint32_t float_args[3])
+{
+    return nvn_replay_dispatch_keyed(replay, name, NULL, x, float_args);
+}

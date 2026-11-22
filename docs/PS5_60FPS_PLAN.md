@@ -192,3 +192,62 @@ Next:
 2. Find which sync the game waits on (by call site) and whether it is frame N-1's end. If so,
    submitting just that frame's final batch earlier would help, without splitting every fence.
 3. Section 5 (two workers) still applies.
+
+## R94: 60 fps outdoors, standing and turning (2026-11-22)
+
+Test: `F:\Pokopia-work\perf.sh TAG` boots the outdoor save, measures 15 s standing still, then
+holds the right stick for 30 s (the camera turns the whole time). Same save, same time of day each
+boot.
+
+| Build | Still | Turning (mean / min) |
+|---|---|---|
+| Codex's uncommitted work + its flags (start) | 59.3 | 56.4 / 54.4 |
+| R94 | 59.6–59.7 | 59.7 / 59.6 |
+
+Windows run at 298–299 presents per 5 s (the FPS counter shows 59.6–59.8); the 1–2 missing
+frames per window are there standing still too.
+
+What changed:
+
+- **Program lookups:** `nvn_front` kept programs in a list. A program cache miss walked the whole
+  list, and the bind-program path on the render thread missed constantly: 14% of its host time
+  while turning. Programs are now also in hash buckets (`program_buckets`).
+- **Guest heap check:** `guest_heap_plain` scanned every stack alias (up to 128) on each guest
+  access the host makes. It now caches 64 KiB blocks known to be alias-free, tagged with an alias
+  generation bumped on every snapshot. Render thread 12% → 1.5%; the worker also dropped ~10%.
+- **Indirect calls:** every guest indirect call (the game's virtual calls on all threads) went
+  through `dispatch_graphics`, which did timing and per-thread bookkeeping (emulated TLS, a TSC
+  read, two atomic stores) before checking whether the target was a graphics call at all. The
+  address check now comes first. Main thread −10%, render thread −4.5%.
+- **Per-call timing:** off by default (debug flags bit 15). `stat_now_ns` no longer calls
+  `pthread_once` each read. `STAT_ADD` is a plain load and store instead of a locked add.
+- **Default flags:** with no `debug/flags` file the loader uses `POKOPIA_DEBUG_DEFAULTS`
+  (`vk_flush.h`): bits 9, 15, 18–22 and 24. Before, the speedups only applied when the file held
+  Codex's value (2172387904), and a missing file meant 0.
+
+New debug flags: 15 (no per-call NVN timing), 16 (pause the sampling profiler; measured neutral).
+
+Measured and not kept (A/B while turning, same session):
+
+| Flag / change | Result |
+|---|---|
+| 25 precise main-thread sleep (spin) | −0.7 fps |
+| 26 pin main, render and worker threads | −0.7 fps |
+| 27 direct uniforms, 29 interned dispatch, 30 alias bins | neutral to −0.5 fps |
+| 2 submit at every fence | +0.3, noise |
+| Main-thread 1 ms polls shortened to 0.25 ms | −0.3 fps |
+| Profiler paused (16) | neutral |
+
+How a frame goes now (frame trace, `debug/flags` bit 28): the main thread's loop waits until the
+frame is due (1 ms sleeps), signals the render thread, which records ~9–10 ms of NVN calls and
+submits; the main thread then presents. The render thread is ~50% busy and the worker ~64%, so
+the frame is the chain, not one saturated thread.
+
+Still open:
+
+- **Late-session drift:** the game's job threads (t4–t8) get busier the longer a session runs (t4
+  +50 ms per 5 s window early on); most of it is guest math under `f_710190b640`'s callers, so
+  game-side work. Earlier builds dropped from 59 to 49 fps by in-game sunset; not retested on R94
+  past ~10 minutes.
+- **Render thread recording** is still ~4.5 ms of host time a frame (indexed draws ~535 ns each,
+  ~2,400 a frame). Shaving it is the main remaining margin.

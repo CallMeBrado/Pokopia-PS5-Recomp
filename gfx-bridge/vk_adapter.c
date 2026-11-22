@@ -637,7 +637,7 @@ uint64_t pokopia_replay_job_epoch = 1;
 void (*pokopia_vk_image_forget_hook)(VkImage image);
 void (*pokopia_vk_before_batch_end_hook)(VkCommandBuffer command);
 void (*pokopia_vk_texture_forget_hook)(void *texture);
-volatile unsigned pokopia_debug_flags;
+volatile unsigned pokopia_debug_flags = POKOPIA_DEBUG_DEFAULTS; /* R94 */
 void (*pokopia_vk_after_submit_hook)(void);
 VkCommandBuffer (*pokopia_vk_batch_command_hook)(void);
 uint64_t (*pokopia_now_ns)(void);

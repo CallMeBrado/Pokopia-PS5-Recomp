@@ -53,6 +53,19 @@ bool pokopia_live_generic_batch_open(void);
  * redundant-bind skipping; bit 1: no batch submit at fence syncs;
  * bit 4: use the graphics lock for image acquire; bit 5: retain all draws). */
 extern volatile unsigned pokopia_debug_flags;
+enum { POKOPIA_DEBUG_SAMPLE_NVNS = 1u << 18, POKOPIA_DEBUG_SAMPLE_DRAWS = 1u << 19 };
+/* R94: bit 15 turns off per-call NVN timing. POKOPIA_DEBUG_DEFAULTS apply when
+ * there is no debug/flags file: the switches measured faster on the PS5 (bit 9
+ * non-blocking sync polls, 15, 18-19 sampled timing, 20 quiet acquire log, 21
+ * direct draw replay, 22 last-pipeline cache, 24 texture descriptor reuse). */
+enum { POKOPIA_DEBUG_NO_NVN_TIMING = 1u << 15 };
+#define POKOPIA_DEBUG_DEFAULTS     ((1u << 9) | (1u << 15) | (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22) | (1u << 24))
+
+/* Sample once per group with a varying offset to cover repeated draw patterns. */
+static inline bool pokopia_timing_sample(uint64_t iteration)
+{
+    return ((iteration ^ (iteration >> 4)) & 15u) == 0;
+}
 /* R90: number of draws in the open batch (0 when none is open). */
 uint32_t pokopia_live_generic_batch_count(void);
 /* R76: cheap monotonic clock (invariant TSC) set by the loader; replay and draw

@@ -35,6 +35,10 @@ typedef struct {
 } NvnReplayTextureCopy;
 
 typedef struct NvnReplayJob NvnReplayJob;
+#if defined(__PROSPERO__)
+void nvn_replay_trace_submission(const NvnReplayJob *job, uint64_t seq);
+void pokopia_trace_producer(const char *kind, uint64_t ns, uint64_t first, uint64_t second);
+#endif
 
 typedef struct {
     NvnFront *front;
@@ -83,6 +87,10 @@ NvnFrontReplyKind nvn_replay_run_job(NvnReplay *replay, NvnReplayJob *job);
 NvnReplay *nvn_replay_create(const NvnReplayConfig *config);
 NvnFrontReplyKind nvn_replay_dispatch(NvnReplay *replay, const char *name, uint64_t x[32],
                                      const uint32_t float_args[3]);
+/* static_key is NULL or the matching name from the front's static proc table.
+ * The caller serializes the per-replay cache along with recording dispatch. */
+NvnFrontReplyKind nvn_replay_dispatch_keyed(NvnReplay *replay, const char *name, const char *static_key,
+                                           uint64_t x[32], const uint32_t float_args[3]);
 /* Take a memory request under the dispatch lock. Invoke the registered callback
  * unlocked and retry after the same encoder receives the requested memory. */
 bool nvn_replay_take_memory_request(NvnReplay *replay, NvnReplayMemoryRequest *request);
