@@ -1235,6 +1235,8 @@ static void kernel_unlock(void)
 
 static unsigned gfx_release_all(void);
 static void gfx_restore(unsigned depth);
+static void rec_lock(void);
+static void rec_unlock(void);
 static unsigned rec_release_all(void);
 static void rec_restore(unsigned depth);
 static void gfx_lock_late(void);
@@ -3142,19 +3144,30 @@ static NvnFrontReplyKind present_nvn_frame(const uint64_t x[32])
     return present_nvn_frame_execute(x);
 }
 
+static void release_nvn_image(uint64_t window, uint32_t index)
+{
+    rec_lock();
+    nvn_window_release(windows, window, index);
+    rec_unlock();
+}
+
 static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
 {
     NvnFrontQueueInfo queue;
     NvnWindowInfo window;
     NvnFrontTextureInfo image;
     const uint32_t index = (uint32_t)x[2];
-    if (!nvn_front_get_queue(nvn, x[0], &queue) || !nvn_window_get_acquired(windows, x[1], index, &window) ||
-        window.device != queue.device || !nvn_front_get_texture(nvn, window.textures[index], &image))
+    rec_lock();
+    const bool valid = nvn_front_get_queue(nvn, x[0], &queue) &&
+        nvn_window_get_acquired(windows, x[1], index, &window) && window.device == queue.device &&
+        nvn_front_get_texture(nvn, window.textures[index], &image);
+    rec_unlock();
+    if (!valid)
         return NVN_FRONT_INVALID_GUEST;
     PokopiaVkTexture *texture = image.native;
     if (!texture || !texture->backing.image || !texture->render_serial) {
         if (replay_worker_thread) {
-            nvn_window_release(windows, x[1], index); /* R78: nothing drawn yet; drop this frame */
+            release_nvn_image(x[1], index); /* R78: nothing drawn yet; drop this frame */
             return NVN_FRONT_HANDLED;
         }
         return NVN_FRONT_BOUNDARY;
@@ -3163,7 +3176,7 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
     /* The headless test consumes completed images and releases the same NVN window slots. */
     if (texture->render_serial > graphics.render_serial)
         return NVN_FRONT_BOUNDARY;
-    nvn_window_release(windows, x[1], index);
+    release_nvn_image(x[1], index);
     if (texture->render_serial <= 8) {
         fprintf(probe_log, "Host headless present render serial=%" PRIu64 " image=%u\n", texture->render_serial, index);
 #ifdef POKOPIA_SPARSE_HEAP
@@ -3272,7 +3285,7 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
     /* R61: the R60 loading-screen frame cap is off; it slept 80 s per load
      * without shortening it (loading ended at 364 s either way). */
     retire_cold_textures();
-    nvn_window_release(windows, x[1], index);
+    release_nvn_image(x[1], index);
 #ifdef POKOPIA_ORBIS_MEMORY_TRACE
     static uint64_t live_presents;
     if (++live_presents % 256 == 0) {
@@ -4070,6 +4083,9 @@ static bool dispatch_graphics_inner(Ctx *context, uint64_t address)
     if (!record_only && call_name)
         record_only = nvn_front_is_shared_call(nvn, address) ||
                       (replay_worker_running && !strcmp(call_name, "nvnSyncWait")) ||
+                      (replay_worker_running && !(pokopia_debug_flags & 16) &&
+                       (!strcmp(call_name, "nvnWindowAcquireTexture") ||
+                        !strcmp(call_name, "nvnQueueAcquireTexture"))) ||
                       /* R80: window getters (t1 waited ~1.2 s a window behind the worker) */
                       !strcmp(call_name, "nvnWindowGetPresentInterval") || !strcmp(call_name, "nvnWindowGetCrop");
     /* Graphics before recording, so a thread waiting out the worker does not

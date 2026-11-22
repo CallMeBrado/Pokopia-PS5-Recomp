@@ -8,6 +8,10 @@
  * vertex input and pipeline state from the draw itself, then retires it with the
  * same submit-and-wait as the pinned path. */
 
+#if defined(__x86_64__) && defined(__SSE4_2__)
+#include <nmmintrin.h>
+#endif
+
 /* R75: open-addressed pipeline cache (power of two). */
 enum { GENERIC_SUPPORT_BINDING = 0, GENERIC_CACHE_SLOTS = 4096, GENERIC_MAX_UNIFORM = 65536 };
 
@@ -191,10 +195,31 @@ static struct {
 static uint64_t generic_hash(const void *data, size_t bytes)
 {
     const uint8_t *p = data;
-    uint64_t h = UINT64_C(1469598103934665603);
-    for (size_t i = 0; i < bytes; ++i)
-        h = (h ^ p[i]) * UINT64_C(1099511628211);
-    return h;
+    size_t i = 0;
+#if defined(__x86_64__) && defined(__SSE4_2__)
+    /* The cache still compares the full keys. CRC32C avoids a serial
+     * multiply for every byte of every sampler or layout key. */
+    uint64_t hash = UINT32_MAX;
+    for (; i + sizeof(uint64_t) <= bytes; i += sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, p + i, sizeof word);
+        hash = _mm_crc32_u64(hash, word);
+    }
+    for (; i < bytes; ++i)
+        hash = _mm_crc32_u8((uint32_t)hash, p[i]);
+    return hash ^ (hash >> 16);
+#else
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (; i + sizeof(uint64_t) <= bytes; i += sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, p + i, sizeof word);
+        hash = (hash ^ word) * UINT64_C(1099511628211);
+        hash ^= hash >> 29;
+    }
+    for (; i < bytes; ++i)
+        hash = (hash ^ p[i]) * UINT64_C(1099511628211);
+    return hash;
+#endif
 }
 
 static VkSampler generic_cached_sampler(VkDevice device, const DrawFunctions *fn, const VkSamplerCreateInfo *info)
@@ -314,7 +339,7 @@ typedef struct {
     VkFence fence;
     VkDescriptorPool pool;
     GenericWork works[GENERIC_BATCH];
-    uint32_t count;
+    uint32_t retire_count;
     uint64_t id;
     bool pending;
     /* R78: image-only compute dispatches recorded into the batch */
@@ -442,9 +467,9 @@ static void generic_slot_release(GenericSlot *slot)
 {
     PokopiaVkAdapter *adapter = generic_batch.adapter;
     const DrawFunctions *fn = &generic_batch.fn;
-    for (uint32_t i = 0; i < slot->count; ++i)
+    for (uint32_t i = 0; i < slot->retire_count; ++i)
         generic_release(adapter, fn, &slot->works[i]);
-    slot->count = 0;
+    slot->retire_count = 0;
     if (slot->pool && generic_reset_pool)
         generic_reset_pool(adapter->device, slot->pool, 0);
     if (slot->compute_pool && generic_reset_pool)
@@ -468,7 +493,7 @@ static void generic_slot_retire(GenericSlot *slot)
     slot->pending = false;
     if (waited != VK_SUCCESS) {
         /* Lost or hung: keep the objects rather than free ones still in use. */
-        slot->count = 0;
+        slot->retire_count = 0;
         slot->command = VK_NULL_HANDLE;
         return;
     }
@@ -488,7 +513,6 @@ static VkResult generic_batch_submit(bool wait)
     VkResult result = VK_SUCCESS;
     GenericSlot *slot = &generic_slots[generic_slot];
     if (generic_batch.command || generic_batch.count) {
-        slot->count = generic_batch.count;
         bool submitted = false;
         if (generic_batch.command) {
             generic_end_rendering();
@@ -868,17 +892,12 @@ static VkResult generic_upload(const PokopiaVkAdapter *adapter, const DrawFuncti
 {
     if (!guest_import_tried)
         generic_guest_import(adapter, fn);
-    uint8_t support[SUPPORT_BUFFER_BYTES] = {0};
-    const float unit_scale = 1.0f;
-    for (size_t i = 0; i < 73; ++i)
-        memcpy(support + 0xc0 + i * 16, &unit_scale, sizeof unit_scale);
     const size_t uniform_align = (size_t)adapter->properties.limits.minUniformBufferOffsetAlignment;
     const size_t uniform_limit = adapter->properties.limits.maxUniformBufferRange < GENERIC_MAX_UNIFORM ?
         (size_t)adapter->properties.limits.maxUniformBufferRange : GENERIC_MAX_UNIFORM;
     if (!uniform_align)
         return VK_ERROR_INITIALIZATION_FAILED;
-    work->support_offset = 0;
-    size_t bytes = sizeof support;
+    size_t bytes = 0;
     for (uint32_t i = 0; i < draw->uniform_count; ++i) {
         bytes = generic_align(bytes, uniform_align);
         work->uniform_offsets[i] = bytes;
@@ -908,13 +927,16 @@ static VkResult generic_upload(const PokopiaVkAdapter *adapter, const DrawFuncti
         pokopia_generic_upload_bytes[0] += work->uniform_bytes[i];
 
     const VkDevice device = adapter->device;
-    /* R75/R77: each draw of a batch takes the next range of its slot's half of
-     * the shared buffer. */
+    /* Each slot reserves an immutable support uniform before its draw data. */
     const size_t arena_align = uniform_align > 256 ? uniform_align : 256;
-    if (generic_shared.buffer && generic_shared.device == device && generic_batch.count &&
-        generic_align((size_t)generic_batch.arena_used, arena_align) + bytes > generic_shared.size / GENERIC_SLOTS)
+    const size_t first = generic_align(SUPPORT_BUFFER_BYTES, arena_align);
+    if (generic_shared.buffer && generic_shared.device == device &&
+        (generic_batch.command || generic_batch.count) &&
+        generic_align((size_t)generic_batch.arena_used, arena_align) + first + bytes >
+            generic_shared.size / GENERIC_SLOTS)
         generic_batch_submit(false);
-    if (generic_shared.buffer && (generic_shared.device != device || bytes > generic_shared.size / GENERIC_SLOTS)) {
+    if (generic_shared.buffer &&
+        (generic_shared.device != device || first + bytes > generic_shared.size / GENERIC_SLOTS)) {
         /* Grow the shared buffer once nothing uses it. */
         generic_batch_submit(true);
         fn->DestroyBuffer(generic_shared.device, generic_shared.buffer, NULL);
@@ -926,13 +948,13 @@ static VkResult generic_upload(const PokopiaVkAdapter *adapter, const DrawFuncti
     VkDeviceSize create_bytes = bytes;
     if (!generic_shared.buffer) {
         create_bytes = GENERIC_ARENA_BYTES;
-        while (create_bytes / GENERIC_SLOTS < bytes)
+        while (create_bytes / GENERIC_SLOTS < first + bytes)
             create_bytes <<= 1;
     }
     const VkDeviceSize half = (generic_shared.buffer ? generic_shared.size : create_bytes) / GENERIC_SLOTS;
     const VkDeviceSize base = generic_align((size_t)generic_batch.arena_used, arena_align);
-    const VkDeviceSize place = half * generic_slot + base;
-    work->support_offset += place;
+    work->support_offset = half * generic_slot;
+    const VkDeviceSize place = work->support_offset + first + base;
     for (uint32_t i = 0; i < draw->uniform_count; ++i)
         work->uniform_offsets[i] += place;
     for (uint32_t i = 0; i < draw->binding_count; ++i)
@@ -953,7 +975,6 @@ static VkResult generic_upload(const PokopiaVkAdapter *adapter, const DrawFuncti
         uint8_t *base = generic_shared.mapped;
         /* R74: no memset: every range a descriptor or binding reads is written below
          * (an empty uniform reads 16 bytes, zeroed here). */
-        memcpy(base + work->support_offset, support, sizeof support);
         for (uint32_t i = 0; i < draw->uniform_count; ++i)
             if (!work->uniform_bytes[i])
                 memset(base + work->uniform_offsets[i], 0, 16);
@@ -1002,8 +1023,14 @@ static VkResult generic_upload(const PokopiaVkAdapter *adapter, const DrawFuncti
         generic_batch.arena_used = base + bytes;
     }
     uint8_t *out = mapped;
+    const float unit_scale = 1.0f;
+    for (unsigned slot = 0; slot < GENERIC_SLOTS; ++slot) {
+        uint8_t *support = out + half * slot;
+        memset(support, 0, SUPPORT_BUFFER_BYTES);
+        for (unsigned i = 0; i < 73; ++i)
+            memcpy(support + 0xc0 + i * 16, &unit_scale, sizeof unit_scale);
+    }
     memset(out + place, 0, bytes);
-    memcpy(out + work->support_offset, support, sizeof support);
     for (uint32_t i = 0; i < draw->uniform_count; ++i)
         if (work->uniform_bytes[i])
             memcpy(out + work->uniform_offsets[i], draw->uniforms[i].data.data, work->uniform_bytes[i]);
@@ -1026,28 +1053,6 @@ static VkResult generic_upload(const PokopiaVkAdapter *adapter, const DrawFuncti
 static VkResult generic_descriptors(VkDevice device, const DrawFunctions *fn, const PokopiaGenericDraw *draw,
                                     GenericWork *work)
 {
-    const VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutBinding uniform_bindings[POKOPIA_GENERIC_UNIFORMS + 1];
-    uniform_bindings[0] = (VkDescriptorSetLayoutBinding){GENERIC_SUPPORT_BINDING,
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, NULL};
-    for (uint32_t i = 0; i < draw->uniform_count; ++i)
-        uniform_bindings[i + 1] = (VkDescriptorSetLayoutBinding){draw->uniforms[i].binding,
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, NULL};
-    VkDescriptorSetLayoutBinding texture_bindings[POKOPIA_GENERIC_TEXTURES];
-    uint32_t texel_count = 0;
-    for (uint32_t i = 0; i < draw->texture_count; ++i) {
-        texel_count += draw->textures[i].texel != NULL;
-        texture_bindings[i] = (VkDescriptorSetLayoutBinding){draw->textures[i].binding,
-            draw->textures[i].texel ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            1, stages, NULL};
-    }
-    const VkDescriptorSetLayoutCreateInfo infos[3] = {
-        {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-         .bindingCount = draw->uniform_count + 1, .pBindings = uniform_bindings},
-        {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO},
-        {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-         .bindingCount = draw->texture_count, .pBindings = texture_bindings},
-    };
     GenericLayoutKey layout_key;
     memset(&layout_key, 0, sizeof layout_key);
     layout_key.uniform_count = draw->uniform_count;
@@ -1069,6 +1074,26 @@ static VkResult generic_descriptors(VkDevice device, const DrawFunctions *fn, co
         work->pipeline_layout = generic_layout_cache[layout_slot].pipeline_layout;
         work->layouts_cached = true;
     } else {
+        const VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBinding uniform_bindings[POKOPIA_GENERIC_UNIFORMS + 1];
+        uniform_bindings[0] = (VkDescriptorSetLayoutBinding){GENERIC_SUPPORT_BINDING,
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, NULL};
+        for (uint32_t i = 0; i < draw->uniform_count; ++i)
+            uniform_bindings[i + 1] = (VkDescriptorSetLayoutBinding){draw->uniforms[i].binding,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, NULL};
+        VkDescriptorSetLayoutBinding texture_bindings[POKOPIA_GENERIC_TEXTURES];
+        for (uint32_t i = 0; i < draw->texture_count; ++i) {
+            texture_bindings[i] = (VkDescriptorSetLayoutBinding){draw->textures[i].binding,
+                draw->textures[i].texel ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                1, stages, NULL};
+        }
+        const VkDescriptorSetLayoutCreateInfo infos[3] = {
+            {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+             .bindingCount = draw->uniform_count + 1, .pBindings = uniform_bindings},
+            {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO},
+            {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+             .bindingCount = draw->texture_count, .pBindings = texture_bindings},
+        };
         for (uint32_t i = 0; i < 3; ++i) {
             result = fn->CreateDescriptorSetLayout(device, &infos[i], NULL, &work->layouts[i]);
             if (result != VK_SUCCESS)
@@ -1088,15 +1113,6 @@ static VkResult generic_descriptors(VkDevice device, const DrawFunctions *fn, co
             work->layouts_cached = true;
         }
     }
-    const uint32_t image_count = draw->texture_count - texel_count;
-    const VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, draw->uniform_count + 1},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, image_count ? image_count : 1},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, texel_count ? texel_count : 1},
-    };
-    const VkDescriptorPoolCreateInfo pool_info = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2, .poolSizeCount = 3, .pPoolSizes = sizes,
-    };
     if (!generic_pool) {
         const VkDescriptorPoolSize shared_sizes[] = {
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (POKOPIA_GENERIC_UNIFORMS + 1) * GENERIC_BATCH},
@@ -1114,6 +1130,18 @@ static VkResult generic_descriptors(VkDevice device, const DrawFunctions *fn, co
         work->pool = generic_pool; /* R75: one slot of a batch; reset per batch */
         work->pool_shared = true;
     } else {
+        uint32_t texel_count = 0;
+        for (uint32_t i = 0; i < draw->texture_count; ++i)
+            texel_count += draw->textures[i].texel != NULL;
+        const uint32_t image_count = draw->texture_count - texel_count;
+        const VkDescriptorPoolSize sizes[] = {
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, draw->uniform_count + 1},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, image_count ? image_count : 1},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, texel_count ? texel_count : 1},
+        };
+        const VkDescriptorPoolCreateInfo pool_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2, .poolSizeCount = 3, .pPoolSizes = sizes,
+        };
         result = fn->CreateDescriptorPool(device, &pool_info, NULL, &work->pool);
         if (result != VK_SUCCESS)
             return result;
@@ -1138,7 +1166,7 @@ static VkResult generic_descriptors(VkDevice device, const DrawFunctions *fn, co
     for (uint32_t i = 0; i <= draw->uniform_count; ++i)
         writes[count++] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = work->sets[0],
-            .dstBinding = uniform_bindings[i].binding, .descriptorCount = 1,
+            .dstBinding = i ? draw->uniforms[i - 1].binding : GENERIC_SUPPORT_BINDING, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &buffers[i],
         };
     for (uint32_t i = 0; i < draw->texture_count; ++i) {
@@ -1241,22 +1269,7 @@ static VkResult generic_pipeline(VkDevice device, const DrawFunctions *fn, const
     }
     GenericKey key;
     generic_key(draw, &key);
-    /* R75: hashed a word at a time and looked up in an open-addressed table;
-     * the byte-wise hash and linear scan of up to 1024 entries cost ~0.6 s per
-     * 5 s in the world. */
-    uint64_t hash = UINT64_C(0xcbf29ce484222325);
-    {
-        const unsigned char *bytes = (const unsigned char *)&key;
-        size_t i = 0;
-        for (; i + 8 <= sizeof key; i += 8) {
-            uint64_t word;
-            memcpy(&word, bytes + i, sizeof word);
-            hash = (hash ^ word) * UINT64_C(0x100000001b3);
-            hash ^= hash >> 29;
-        }
-        for (; i < sizeof key; ++i)
-            hash = (hash ^ bytes[i]) * UINT64_C(0x100000001b3);
-    }
+    uint64_t hash = generic_hash(&key, sizeof key);
     if (!hash)
         hash = 1; /* 0 marks an empty slot */
     size_t slot = (size_t)hash & (GENERIC_CACHE_SLOTS - 1);
@@ -1686,7 +1699,15 @@ VkResult pokopia_live_draw_generic(PokopiaVkAdapter *adapter, const PokopiaGener
     if (!generic_batch.command)
         (void)generic_batch_open(adapter, &fn); /* a failed draw may hold pool sets */
     if (generic_batch.command && generic_batch.count < GENERIC_BATCH) {
-        generic_slots[generic_slot].works[generic_batch.count++] = work;
+        ++generic_batch.count;
+        /* Shared buffers and pools and cached objects are kept alive by the
+         * slot or their cache. Only per-draw allocations need a retirement
+         * record. Preserve cleanup for partially initialized draws. */
+        if ((pokopia_debug_flags & 32) || result != VK_SUCCESS || work.command ||
+            !work.shared_buffer || !work.pool_shared || !work.layouts_cached || !work.pipeline_cached) {
+            GenericSlot *slot = &generic_slots[generic_slot];
+            slot->works[slot->retire_count++] = work;
+        }
         for (uint32_t i = 0; i < draw->texture_count; ++i)
             if (draw->textures[i].texel)
                 draw->textures[i].texel->batch_stamp = pokopia_vk_batch_id;
@@ -1878,13 +1899,16 @@ VkResult pokopia_live_compute_generic(PokopiaVkAdapter *adapter, const PokopiaGe
     bool slot_resources = c->storage_count == 0 || storage_direct;
     if (slot_resources) {
         const VkDeviceSize half = generic_shared.size / GENERIC_SLOTS;
-        const VkDeviceSize at = generic_align((size_t)generic_batch.arena_used, 256);
-        if (!generic_shared.buffer || generic_shared.device != device || at + bytes > half ||
+        const size_t uniform_align = (size_t)limits->minUniformBufferOffsetAlignment;
+        const size_t arena_align = uniform_align > 256 ? uniform_align : 256;
+        const VkDeviceSize first = generic_align(SUPPORT_BUFFER_BYTES, arena_align);
+        const VkDeviceSize at = generic_align((size_t)generic_batch.arena_used, arena_align);
+        if (!generic_shared.buffer || generic_shared.device != device || first + at + bytes > half ||
             generic_slots[generic_slot].compute_count >= COMPUTE_PER_BATCH || !generic_sync_procs(adapter)) {
             slot_resources = false;
         } else {
             for (uint32_t i = 0; i < range_count; ++i)
-                offsets[i] += half * generic_slot + at;
+                offsets[i] += half * generic_slot + first + at;
             generic_batch.arena_used = at + bytes;
         }
     }

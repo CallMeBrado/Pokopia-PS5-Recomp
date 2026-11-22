@@ -1183,6 +1183,22 @@ static void test_memory_pool(NvnFront *front, Probe *probe, uint64_t loader)
     assert(!nvn_front_resolve_pool(front, DEVICE, QUEUE_MEMORY, 1, &hit));
     invoke(front, finalize_pool, POOL, 0, 0);
 
+    /* A pool that starts later need not contain all of the requested span. */
+    invoke(front, 0x75005e2450ULL, POOL_BUILDER, 0x22, 0);
+    invoke(front, set_storage, POOL_BUILDER, QUEUE_MEMORY, 0x3000);
+    assert(invoke(front, initialize, POOL, POOL_BUILDER, 0) == 1);
+    invoke(front, set_storage, POOL_BUILDER, QUEUE_MEMORY + 0x1000, 0x1000);
+    assert(invoke(front, initialize, SECOND_POOL, POOL_BUILDER, 0) == 1);
+    assert(!nvn_front_resolve_pool(front, DEVICE, QUEUE_MEMORY + 0x1000, 1, &hit));
+    assert(nvn_front_resolve_pool(front, DEVICE, QUEUE_MEMORY + 0x1000, 0x2000, &hit));
+    assert(hit.object == POOL && hit.offset == 0x1000);
+    invoke(front, finalize_pool, POOL, 0, 0);
+    assert(!nvn_front_resolve_pool(front, DEVICE, QUEUE_MEMORY + 0x1000, 0x2000, &hit));
+    assert(nvn_front_resolve_pool(front, DEVICE, QUEUE_MEMORY + 0x1000, 1, &hit));
+    assert(hit.object == SECOND_POOL && hit.offset == 0);
+    invoke(front, finalize_pool, SECOND_POOL, 0, 0);
+    invoke(front, set_storage, POOL_BUILDER, QUEUE_MEMORY, 0x1000);
+
     invoke(front, set_device, POOL_BUILDER, 0, 0);
     regs[0] = POOL;
     assert(nvn_front_dispatch(front, initialize, regs).kind == NVN_FRONT_INVALID_GUEST);

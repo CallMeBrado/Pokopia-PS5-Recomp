@@ -50,7 +50,8 @@ bool pokopia_live_generic_wait_batch(uint64_t id);
 /* R78: true while general draws are being recorded into an unsubmitted batch. */
 bool pokopia_live_generic_batch_open(void);
 /* R90: A/B switches read from debug/flags in the mailbox (bit 0: no
- * redundant-bind skipping; bit 1: no batch submit at fence syncs). */
+ * redundant-bind skipping; bit 1: no batch submit at fence syncs;
+ * bit 4: use the graphics lock for image acquire; bit 5: retain all draws). */
 extern volatile unsigned pokopia_debug_flags;
 /* R90: number of draws in the open batch (0 when none is open). */
 uint32_t pokopia_live_generic_batch_count(void);

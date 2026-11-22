@@ -184,6 +184,11 @@ typedef struct Pool {
     size_t texture_uses;
 } Pool;
 
+typedef struct {
+    const Pool *pool;
+    uint64_t max_end; /* Largest pool end up to this entry on the same device. */
+} PoolIndexEntry;
+
 typedef struct Buffer {
     struct Buffer *next;
     const Pool *pool;
@@ -241,6 +246,9 @@ struct NvnFront {
     NvnFrontConfig config;
     Object *devices, *queues, *syncs;
     Pool *pools;
+    PoolIndexEntry *pool_index;
+    size_t pool_index_count, pool_index_capacity;
+    bool pool_index_disabled;
     Buffer *buffers;
     Texture *textures;
     Sampler *samplers;
@@ -672,6 +680,74 @@ static uint32_t normalize_pool_flags(uint32_t flags)
     return (flags & ~(uint32_t)(POOL_CPU_MASK | POOL_GPU_MASK)) | cpu | gpu;
 }
 
+/* Pool registration is infrequent relative to draw replay. Keep GPU-visible
+ * pools sorted by (device, storage) so reads can skip unrelated pools. */
+static size_t pool_upper_bound(const NvnFront *front, uint64_t device, uint64_t address)
+{
+    size_t lo = 0, hi = front->pool_index_count;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        const NvnFrontPoolConfig *config = &front->pool_index[mid].pool->config;
+        if (config->device < device || (config->device == device && config->storage <= address))
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static void refresh_pool_ends(NvnFront *front, size_t start)
+{
+    PoolIndexEntry *entries = front->pool_index;
+    for (size_t i = start; i < front->pool_index_count; ++i) {
+        const NvnFrontPoolConfig *config = &entries[i].pool->config;
+        const uint64_t end = config->storage + config->size;
+        const uint64_t previous_end = i && entries[i - 1].pool->config.device == config->device ?
+            entries[i - 1].max_end : 0;
+        entries[i].max_end = end > previous_end ? end : previous_end;
+    }
+}
+
+static void index_pool(NvnFront *front, const Pool *pool)
+{
+    if (front->pool_index_disabled || (pool->config.flags & POOL_GPU_NO_ACCESS))
+        return;
+    if (front->pool_index_count == front->pool_index_capacity) {
+        const size_t capacity = front->pool_index_capacity ? front->pool_index_capacity * 2 : 16;
+        PoolIndexEntry *entries = realloc(front->pool_index, capacity * sizeof *entries);
+        if (!entries) {
+            /* Registration remains usable if the optional index cannot grow. */
+            free(front->pool_index);
+            front->pool_index = NULL;
+            front->pool_index_disabled = true;
+            return;
+        }
+        front->pool_index = entries;
+        front->pool_index_capacity = capacity;
+    }
+    const size_t at = pool_upper_bound(front, pool->config.device, pool->config.storage);
+    PoolIndexEntry *entries = front->pool_index;
+    memmove(entries + at + 1, entries + at, (front->pool_index_count - at) * sizeof *entries);
+    entries[at].pool = pool;
+    ++front->pool_index_count;
+    refresh_pool_ends(front, at);
+}
+
+static void unindex_pool(NvnFront *front, const Pool *pool)
+{
+    if (front->pool_index_disabled || (pool->config.flags & POOL_GPU_NO_ACCESS))
+        return;
+    PoolIndexEntry *entries = front->pool_index;
+    for (size_t at = 0; at < front->pool_index_count; ++at) {
+        if (entries[at].pool == pool) {
+            --front->pool_index_count;
+            memmove(entries + at, entries + at + 1, (front->pool_index_count - at) * sizeof *entries);
+            refresh_pool_ends(front, at);
+            return;
+        }
+    }
+}
+
 static NvnFrontReplyKind initialize_pool(NvnFront *front, uint64_t x[32])
 {
     const uint8_t *builder = read_guest(front, x[1], POOL_BUILDER_BYTES);
@@ -704,6 +780,7 @@ static NvnFrontReplyKind initialize_pool(NvnFront *front, uint64_t x[32])
     *pool = (Pool){ .next = front->pools, .address = x[0], .config = config };
     memset(object, 0, POOL_BYTES);
     front->pools = pool;
+    index_pool(front, pool);
     x[0] = 1;
     return NVN_FRONT_HANDLED;
 }
@@ -746,6 +823,7 @@ static NvnFrontReplyKind pool_operation(NvnFront *front, uint32_t offset, uint64
         for (const CommandBuffer *command = front->command_buffers; command; command = command->next)
             if (command->info.command_pool == x[0])
                 return NVN_FRONT_INVALID_GUEST;
+        unindex_pool(front, pool);
         remove_pool(link);
         break;
     case POOL_MAP:
@@ -2631,18 +2709,33 @@ bool nvn_front_get_pool(NvnFront *front, uint64_t pool_address, NvnFrontPoolConf
 bool nvn_front_resolve_pool(const NvnFront *front, uint64_t device_address, uint64_t buffer_address,
     size_t size, NvnFrontPoolHit *hit)
 {
-    if (!front || !hit || !size)
+    if (!front || !hit || !buffer_address || !size || size > UINT64_MAX - buffer_address)
         return false;
+    const uint64_t end = buffer_address + size;
     const Pool *match = NULL;
-    for (const Pool *pool = front->pools; pool; pool = pool->next) {
-        const NvnFrontPoolConfig *config = &pool->config;
-        if (config->device != device_address || (config->flags & POOL_GPU_NO_ACCESS) ||
-            buffer_address < config->storage || size > config->size ||
-            buffer_address - config->storage > config->size - size)
-            continue;
-        if (match)
-            return false;
-        match = pool;
+    if (front->pool_index_disabled) {
+        for (const Pool *pool = front->pools; pool; pool = pool->next) {
+            const NvnFrontPoolConfig *config = &pool->config;
+            if (config->device != device_address || (config->flags & POOL_GPU_NO_ACCESS) ||
+                config->storage > buffer_address || config->storage + config->size < end)
+                continue;
+            if (match)
+                return false;
+            match = pool;
+        }
+    } else {
+        size_t i = pool_upper_bound(front, device_address, buffer_address);
+        while (i) {
+            const PoolIndexEntry *entry = &front->pool_index[--i];
+            const NvnFrontPoolConfig *config = &entry->pool->config;
+            if (config->device != device_address || entry->max_end < end)
+                break;
+            if (config->storage + config->size < end)
+                continue;
+            if (match)
+                return false;
+            match = entry->pool;
+        }
     }
     if (!match || !read_guest(front, buffer_address, size))
         return false;
@@ -2903,6 +2996,7 @@ void nvn_front_destroy(NvnFront *front)
         remove_buffer(&front->buffers);
     while (front->descriptor_pools)
         remove_descriptor_pool(front, &front->descriptor_pools);
+    free(front->pool_index);
     while (front->pools)
         remove_pool(&front->pools);
     while (front->devices)
