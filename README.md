@@ -23,7 +23,7 @@ own copy of the game (version 2.0.1a), which you dump and recompile yourself.
 
 Boots to the title screen, loads and writes saves, and plays in the world. Around 55-60 fps
 indoors and 47-53 fps outdoors. Button prompts, including the title screen's, show PlayStation
-glyphs. Known issue: clouds render black. Performance notes and plans are in
+glyphs. Performance notes and plans are in
 [docs/PS5_60FPS_PLAN.md](docs/PS5_60FPS_PLAN.md); the original port plan is in
 [docs/PS5_PORT_PLAN.md](docs/PS5_PORT_PLAN.md).
 

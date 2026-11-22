@@ -1,8 +1,173 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "vk_program.h"
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* R95: SPIR-V rewrites made when a module is created.
+ * - InverseSqrt(x) becomes InverseSqrt(max(x, 1e-30)) for 32-bit scalars, so a
+ *   zero-length vector gets a large finite scale instead of +Inf.
+ * - With fmz, scalar a * b becomes (a == 0 || b == 0) ? 0 : a * b and
+ *   fma(a, b, c) becomes (a == 0 || b == 0) ? c : fma(a, b, c): the GPU's
+ *   "zero times anything is zero" multiply, which plain IEEE math turns into
+ *   NaN when the other operand is infinite. Float stores to the outputs also
+ *   turn NaN into 0 and clamp to the largest finite R11G11B10 value (AMD blends
+ *   those targets at half precision, where larger colours overflow).
+ *   The sky's cloud layer (fragment 8010f4846df5fa37) wrote NaN into the HDR
+ *   target, shown as black clouds with a white bloom halo.
+ * Returns a new word stream (free it), or NULL when nothing changed. */
+static uint32_t *spirv_patch(const uint32_t *words, size_t count, bool fmz, size_t *out_count)
+{
+    enum { OP_EXT_INST_IMPORT = 11, OP_EXT_INST = 12, OP_TYPE_BOOL = 20, OP_TYPE_FLOAT = 22, OP_CONSTANT = 43,
+           OP_FUNCTION = 54, OP_FMUL = 133, OP_LOGICAL_OR = 166, OP_SELECT = 169, OP_FORD_EQUAL = 180,
+           OP_VARIABLE = 59, OP_STORE = 62, OP_ACCESS_CHAIN = 65, OP_IS_NAN = 156, STORAGE_OUTPUT = 3,
+           GLSL_INVERSE_SQRT = 32, GLSL_FMAX = 40, GLSL_FCLAMP = 43, GLSL_FMA = 50 };
+    if (!words || count < 5 || words[0] != 0x07230203u)
+        return NULL;
+    uint32_t glsl = 0, float32 = 0, boolean = 0;
+    size_t rsqrts = 0, muls = 0, stores = 0, function_at = 0;
+    /* With fmz, float stores to the fragment outputs also replace NaN with 0. */
+    uint32_t outputs[16], output_count = 0, chains[64], chain_count = 0;
+    for (size_t at = 5; at < count;) {
+        const uint32_t length = words[at] >> 16, op = words[at] & 0xffffu;
+        if (!length || at + length > count)
+            return NULL;
+        if (op == OP_EXT_INST_IMPORT && length >= 3 && !strcmp((const char *)&words[at + 2], "GLSL.std.450"))
+            glsl = words[at + 1];
+        else if (op == OP_TYPE_FLOAT && length == 3 && words[at + 2] == 32)
+            float32 = words[at + 1];
+        else if (op == OP_TYPE_BOOL && length == 2)
+            boolean = words[at + 1];
+        else if (op == OP_FUNCTION && !function_at)
+            function_at = at;
+        else if (op == OP_VARIABLE && length >= 4 && words[at + 3] == STORAGE_OUTPUT && output_count < 16)
+            outputs[output_count++] = words[at + 2];
+        else if (fmz && op == OP_ACCESS_CHAIN && length >= 4 && chain_count < 64) {
+            for (uint32_t i = 0; i < output_count; ++i)
+                if (words[at + 3] == outputs[i])
+                    chains[chain_count++] = words[at + 2];
+        } else if (fmz && op == OP_STORE && length == 3) {
+            for (uint32_t i = 0; i < chain_count; ++i)
+                stores += words[at + 1] == chains[i];
+        }
+        else if (op == OP_EXT_INST && length == 6 && glsl && float32 && words[at + 3] == glsl &&
+                 words[at + 4] == GLSL_INVERSE_SQRT && words[at + 1] == float32)
+            ++rsqrts;
+        else if (fmz && float32 && ((op == OP_FMUL && length == 5 && words[at + 1] == float32) ||
+                                    (op == OP_EXT_INST && length == 8 && glsl && words[at + 3] == glsl &&
+                                     words[at + 4] == GLSL_FMA && words[at + 1] == float32)))
+            ++muls;
+        at += length;
+    }
+    if ((!rsqrts && !muls && !stores) || !function_at)
+        return NULL;
+    uint32_t *out = malloc((count + 19 + rsqrts * 7 + muls * 21 + stores * 18) * sizeof *out);
+    if (!out)
+        return NULL;
+    uint32_t bound = words[3];
+    const uint32_t tiny = bound++, zero = bound++, low = bound++, high = bound++;
+    const bool add_bool = (muls || stores) && !boolean;
+    if (add_bool)
+        boolean = bound++;
+    size_t n = 0;
+    for (size_t at = 0; at < 5; ++at)
+        out[n++] = words[at];
+    for (size_t at = 5; at < count;) {
+        const uint32_t length = words[at] >> 16, op = words[at] & 0xffffu;
+        const uint32_t *w = words + at;
+        if (at == function_at) {
+            const float value = 1e-30f;
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof bits);
+            if (add_bool) {
+                out[n++] = 2u << 16 | OP_TYPE_BOOL;
+                out[n++] = boolean;
+            }
+            out[n++] = 4u << 16 | OP_CONSTANT;
+            out[n++] = float32;
+            out[n++] = tiny;
+            out[n++] = bits;
+            out[n++] = 4u << 16 | OP_CONSTANT;
+            out[n++] = float32;
+            out[n++] = zero;
+            out[n++] = 0;
+            /* the largest finite R11G11B10 value; AMD blends these targets at
+             * half precision, where a larger colour became Inf and then NaN */
+            const float limit = 65024.0f, negative = -65024.0f;
+            uint32_t limit_bits, negative_bits;
+            memcpy(&limit_bits, &limit, sizeof limit_bits);
+            memcpy(&negative_bits, &negative, sizeof negative_bits);
+            out[n++] = 4u << 16 | OP_CONSTANT;
+            out[n++] = float32;
+            out[n++] = low;
+            out[n++] = negative_bits;
+            out[n++] = 4u << 16 | OP_CONSTANT;
+            out[n++] = float32;
+            out[n++] = high;
+            out[n++] = limit_bits;
+        }
+        const bool is_rsqrt = op == OP_EXT_INST && length == 6 && w[3] == glsl && w[4] == GLSL_INVERSE_SQRT &&
+                              w[1] == float32;
+        const bool is_mul = fmz && op == OP_FMUL && length == 5 && w[1] == float32;
+        const bool is_fma = fmz && op == OP_EXT_INST && length == 8 && w[3] == glsl && w[4] == GLSL_FMA &&
+                            w[1] == float32;
+        if (is_rsqrt) {
+            const uint32_t clamped = bound++;
+            const uint32_t fmax[] = {7u << 16 | OP_EXT_INST, float32, clamped, glsl, GLSL_FMAX, w[5], tiny};
+            memcpy(out + n, fmax, sizeof fmax);
+            n += 7;
+            memcpy(out + n, w, 5 * sizeof *out);
+            out[n + 5] = clamped;
+            n += 6;
+        } else if (is_mul || is_fma) {
+            const uint32_t a = w[is_mul ? 3 : 5], b = w[is_mul ? 4 : 6];
+            const uint32_t product = bound++, a_zero = bound++, b_zero = bound++, either = bound++;
+            memcpy(out + n, w, length * sizeof *out);
+            out[n + 2] = product;
+            n += length;
+            const uint32_t tail[] = {
+                5u << 16 | OP_FORD_EQUAL, boolean, a_zero, a, zero,
+                5u << 16 | OP_FORD_EQUAL, boolean, b_zero, b, zero,
+                5u << 16 | OP_LOGICAL_OR, boolean, either, a_zero, b_zero,
+                6u << 16 | OP_SELECT, float32, w[2], either, is_mul ? zero : w[7], product,
+            };
+            memcpy(out + n, tail, sizeof tail);
+            n += sizeof tail / sizeof *tail;
+        } else if (fmz && op == OP_STORE && length == 3 && stores) {
+            bool output = false;
+            for (uint32_t i = 0; i < chain_count; ++i)
+                output |= w[1] == chains[i];
+            if (output) {
+                const uint32_t nan = bound++, clean = bound++, clamped = bound++;
+                const uint32_t fix[] = {
+                    4u << 16 | OP_IS_NAN, boolean, nan, w[2],
+                    6u << 16 | OP_SELECT, float32, clean, nan, zero, w[2],
+                    8u << 16 | OP_EXT_INST, float32, clamped, glsl, GLSL_FCLAMP, clean, low, high,
+                    3u << 16 | OP_STORE, w[1], clamped,
+                };
+                memcpy(out + n, fix, sizeof fix);
+                n += sizeof fix / sizeof *fix;
+            } else {
+                memcpy(out + n, w, length * sizeof *out);
+                n += length;
+            }
+        } else {
+            memcpy(out + n, w, length * sizeof *out);
+            n += length;
+        }
+        at += length;
+    }
+    out[3] = bound;
+    *out_count = n;
+    return out;
+}
+
+/* R95: shaders that get the fmz rewrite (found with debug/skip, see nvn_replay.c). */
+static bool shader_wants_fmz(const char *hash)
+{
+    return hash && !strcmp(hash, "8010f4846df5fa37");
+}
 
 typedef struct {
     const NvnShaderCache *cache;
@@ -169,12 +334,21 @@ bool pokopia_vk_program_acquire_module(const PokopiaVkProgram *program, NvnShade
         nvn_cached_shader_release(&cached);
         return false;
     }
+    size_t guarded_count = 0;
+    uint32_t *guarded = spirv_patch(cached.words, cached.word_count, shader_wants_fmz(linked->hash), &guarded_count);
+    if (guarded && shader_wants_fmz(linked->hash) && program->log) {
+        fprintf(program->log, "NVN SPIR-V patched key=%s stage=%u words %zu -> %zu\n", linked->hash, (unsigned)stage,
+                cached.word_count, guarded_count);
+        fflush(program->log);
+    }
     const VkShaderModuleCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = cached.word_count * sizeof *cached.words, .pCode = cached.words,
+        .codeSize = (guarded ? guarded_count : cached.word_count) * sizeof *cached.words,
+        .pCode = guarded ? guarded : cached.words,
     };
     VkShaderModule module = VK_NULL_HANDLE;
     VkResult result = program->create(program->device, &create_info, NULL, &module);
+    free(guarded);
     if (result == VK_SUCCESS) {
         linked->module = module;
         memcpy(linked->entry, cached.entry, sizeof linked->entry);

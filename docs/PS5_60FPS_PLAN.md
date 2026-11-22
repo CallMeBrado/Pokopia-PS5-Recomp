@@ -251,3 +251,20 @@ Still open:
   past ~10 minutes.
 - **Render thread recording** is still ~4.5 ms of host time a frame (indexed draws ~535 ns each,
   ~2,400 a frame). Shaving it is the main remaining margin.
+
+## R95: black clouds fixed (2026-11-22)
+
+The sky's cloud layer (vertex bf3452f82f8c5f7b, fragment 8010f4846df5fa37, a 2048x256 band
+drawn large around the camera) wrote NaN into the HDR target (R11G11B10); the tonemap showed it
+black and bloom spread a white halo. Found by skipping draws by shader hash at runtime
+(`debug/skip` in the mailbox holds one hash; empty or absent skips nothing).
+
+Fix (`vk_program.c`, `spirv_patch`): when that shader's module is created, scalar multiplies and
+FMAs follow the GPU's zero-times-anything rule, and its colour outputs turn NaN into 0 and clamp
+to the largest finite R11G11B10 value. Every module also gets `InverseSqrt(max(x, 1e-30))`.
+The log line `NVN SPIR-V patched key=...` confirms it. Frame rate unchanged (59.6 still, 59.7
+turning).
+
+Ruled out on the way: zero-filling textures sampled before anything wrote them (the bloom chain
+was the first suspect), and the 51 cloud-puff billboards (096c2fdc7931ecad), which only looked
+guilty because a dump of the HDR target after them already held the NaN.

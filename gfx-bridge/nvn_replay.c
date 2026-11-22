@@ -668,6 +668,7 @@ unsigned nvn_replay_dump_width; /* R82: only a draw sampling a texture this wide
 unsigned nvn_replay_dump_height; /* R91: ... and this tall (0: any) */
 /* R91: skip the first N distinct matching textures (several share a size). */
 unsigned nvn_replay_dump_skip, nvn_replay_dump_seen_count;
+char nvn_replay_skip_hash[24]; /* R95 */
 static const void *dump_seen[16];
 volatile int nvn_replay_dump_pending;
 static bool tracing;
@@ -2650,6 +2651,9 @@ static NvnFrontReplyKind run_draw_generic(NvnReplay *replay, uint64_t device, co
         NvnFrontProgramInfo program;
         if (!require_program_stage(config->front, device, record->program[stage], stage, &program, &stages[stage]))
             GENERIC_SKIP("general draw: program stage unavailable");
+        /* R95: debug/skip in the mailbox names a shader hash whose draws are skipped. */
+        if (nvn_replay_skip_hash[0] && stages[stage].hash && !strcmp(stages[stage].hash, nvn_replay_skip_hash))
+            GENERIC_SKIP(NULL);
         programs[stage] = program.native;
         const char *resources = stages[stage].resources ? stages[stage].resources : "";
         const ParsedResources *parsed = parsed_resources(resources);

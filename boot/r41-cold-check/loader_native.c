@@ -379,6 +379,22 @@ static void update_guest_pad(void)
                     pokopia_debug_flags = flags;
                     fprintf(probe_log, "Debug flags set to %u\n", flags);
                 }
+                /* R95: debug/skip holds a shader hash whose draws are skipped (empty or absent: none). */
+                {
+                    extern char nvn_replay_skip_hash[24];
+                    snprintf(trace_request, sizeof trace_request, "%s/skip", live_capture.mailbox.directory);
+                    FILE *skip_file = fopen(trace_request, "r");
+                    char skip[24] = {0};
+                    if (skip_file) {
+                        if (fscanf(skip_file, "%23s", skip) != 1)
+                            skip[0] = 0;
+                        fclose(skip_file);
+                    }
+                    if (strcmp(skip, nvn_replay_skip_hash)) {
+                        memcpy(nvn_replay_skip_hash, skip, sizeof skip);
+                        fprintf(probe_log, "Skipping draws of shader %s\n", skip[0] ? skip : "(none)");
+                    }
+                }
                 /* R73: dump.req holds a shader hash; dump that draw's textures. */
                 extern char nvn_replay_dump_hash[24];
                 extern volatile int nvn_replay_dump_pending;
