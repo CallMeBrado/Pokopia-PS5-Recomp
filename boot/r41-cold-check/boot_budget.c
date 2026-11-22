@@ -7,6 +7,11 @@
 #include "../../horizon/heap_sparse.h"
 #endif
 
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX)
+#include <stdatomic.h>
+#define POKOPIA_TARGET_LOOKUP_CACHE
+#endif
+
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -399,8 +404,26 @@ bool pokopia_boot_svc(Ctx *cpu, uint32_t number, FILE *log)
     }
 }
 
+#ifdef POKOPIA_TARGET_LOOKUP_CACHE
+enum { TARGET_CACHE_SLOTS = 2048 };
+/* Module function tables have process lifetime. A single atomic pointer
+ * publishes the address and its target together, even on a slot collision. */
+_Alignas(64) static _Atomic(const FnEntry *) target_cache[TARGET_CACHE_SLOTS];
+
+static size_t target_cache_slot(uint64_t address)
+{
+    return ((address >> 2) ^ (address >> 15)) & (TARGET_CACHE_SLOTS - 1);
+}
+#endif
+
 PokopiaBootEntry pokopia_boot_lookup(uint64_t address)
 {
+#ifdef POKOPIA_TARGET_LOOKUP_CACHE
+    const size_t slot = target_cache_slot(address);
+    const FnEntry *hit = atomic_load_explicit(&target_cache[slot], memory_order_relaxed);
+    if (hit && hit->addr == address)
+        return hit->fn;
+#endif
     for (size_t i = 0; i < sizeof modules / sizeof modules[0]; ++i) {
         const NxModule *module = modules[i].module;
         if (address < module->base || address >= module->text_end)
@@ -409,8 +432,13 @@ PokopiaBootEntry pokopia_boot_lookup(uint64_t address)
         while (low < high) {
             int mid = low + (high - low) / 2;
             const FnEntry *entry = &module->fns[mid];
-            if (entry->addr == address)
+            if (entry->addr == address) {
+#ifdef POKOPIA_TARGET_LOOKUP_CACHE
+                if (entry->fn)
+                    atomic_store_explicit(&target_cache[slot], entry, memory_order_relaxed);
+#endif
                 return entry->fn;
+            }
             if (entry->addr < address)
                 low = mid + 1;
             else

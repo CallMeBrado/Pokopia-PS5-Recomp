@@ -22,23 +22,66 @@ jobs=${JOBS:-$(nproc)}
 flags=(-std=c++20 -march=znver2 -mcx16 -O1 -fPIC -fno-exceptions -fno-rtti -ffp-contract=off
    -ffunction-sections -fdata-sections -I "$RECOMP/include")
 
+game_object() {
+   local base=${1##*/}
+   case "$name/${base%.cpp}" in
+      main/c_042|main/c_050|main/c_051|main/c_052|main/c_145)
+         printf '%s/obj/%s.o\n' "$packed_build" "${base%.cpp}" ;;
+      *) printf '%s/%s.o\n' "$out" "${base%.cpp}" ;;
+   esac
+}
+
+compile_unit() {
+   local unit=$1 obj
+   shift
+   obj=$(game_object "$unit")
+   if [[ -s $obj && $obj -nt $unit && ( ! -f ${unit%/*}/funcs.h || $obj -nt ${unit%/*}/funcs.h ) ]]; then
+      return
+   fi
+   local extra=()
+   if [[ -n $packed_build && $obj == "$packed_build/obj/"* ]]; then
+      extra=(-DPOKOPIA_PACKED_FLOAT32 -I "$packed_build/include")
+   fi
+   if ! ps5_cc "${extra[@]}" "$@" -c "$unit" -o "$obj.tmp" 2> "$obj.err"; then
+      echo "FAILED $unit"
+      head -20 "$obj.err"
+      return 255
+   fi
+   mv -- "$obj.tmp" "$obj"
+}
+
 export SDK VK
-export -f ps5_cc
+export -f ps5_cc game_object compile_unit
 for name in "${modules[@]}"; do
    src=${lift[$name]}
    out="$BUILD/obj/game-$name"
    mkdir -p "$out"
+   exec {lock_fd}>"$out/.compile.lock"
+   flock "$lock_fd"
+   packed_build=
+   if [[ $name == main ]]; then
+      packed_build=$(python3 "$POKOPIA/ps5/build/prepare-packed-floats.py" \
+         "$RECOMP/include/nxrecomp" "$out/packed-float32" "${flags[@]}")
+      mkdir -p "$packed_build/obj"
+   fi
+   export name out packed_build
    # Copy the lift to local disk once: compiling from /mnt/e is several times slower.
    local_src="$BUILD/lift/$name"
    mkdir -p "$local_src"
    rsync -a --delete "$src/" "$local_src/"
-   echo "==> $name: $(ls "$local_src"/*.cpp | wc -l) units, $jobs jobs"
+   units=("$local_src"/*.cpp)
+   echo "==> $name: ${#units[@]} units, $jobs jobs"
    start=$SECONDS
-   ls "$local_src"/*.cpp | xargs -P "$jobs" -I{} bash -c '
-      unit={}; obj="'"$out"'/$(basename "${unit%.cpp}").o"
-      [[ -f $obj && $obj -nt $unit ]] && exit 0
-      ps5_cc "$@" -c "$unit" -o "$obj" 2> "$obj.err" || { echo "FAILED $unit"; head -20 "$obj.err"; exit 255; }
-   ' _ "${flags[@]}"
-   "$SDK/bin/prospero-ar" rcs "$BUILD/libpokopia-$name-ps5.a" "$out"/*.o
+   printf '%s\0' "${units[@]}" | xargs -0 -P "$jobs" -I{} bash -c 'compile_unit "$@"' _ {} "${flags[@]}"
+   objects=()
+   for unit in "${units[@]}"; do objects+=("$(game_object "$unit")"); done
+   archive="$BUILD/libpokopia-$name-ps5.a"
+   temp=$(mktemp -d "$BUILD/.archive-$name-XXXXXXXX")
+   trap 'rm -f -- "$temp/library.a"; rmdir -- "$temp"' EXIT
+   "$SDK/bin/prospero-ar" rcs "$temp/library.a" "${objects[@]}"
+   mv -- "$temp/library.a" "$archive"
+   rmdir -- "$temp"
+   trap - EXIT
+   exec {lock_fd}>&-
    echo "==> $name done in $((SECONDS - start)) s: $(du -h "$BUILD/libpokopia-$name-ps5.a" | cut -f1)"
 done
