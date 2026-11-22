@@ -77,6 +77,14 @@ int32_t scePadOpen(int32_t userID, int32_t type, int32_t index, void *param);
 int32_t scePadClose(int32_t handle);
 int32_t scePadReadState(int32_t handle, OrbisPadData *data);
 int32_t scePadSetVibration(int32_t handle, const OrbisPadVibeParam *param);
+/* R96: PS5 libScePad. Signatures inferred; the DualSense ignored
+ * scePadSetVibration (it returned 0) until switched to a compatible mode. */
+int32_t scePadSetVibrationMode(int32_t handle, int32_t mode);
+int32_t scePadSetPS4BcVibrationMode(int32_t handle, int32_t mode);
+int32_t scePadEnablePs4CompatibleMode(int32_t handle);
+typedef struct OrbisPadColor { uint8_t r, g, b, a; } OrbisPadColor;
+int32_t scePadSetLightBar(int32_t handle, const OrbisPadColor *color);
+int32_t scePadSetVibrationStrength(int32_t handle, int32_t strength);
 
 #ifdef __cplusplus
 }

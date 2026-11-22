@@ -9,6 +9,9 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#if defined(__PROSPERO__)
+#include <pthread_np.h>
+#endif
 #include <signal.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
@@ -677,11 +680,26 @@ typedef struct {
     atomic_int in_host, host_pc_ready;
     atomic_uint_fast64_t host_pc, host_caller, host_caller2, host_caller3; /* R76: first eboot return address when pc is in a system library */
     atomic_uint_fast64_t gfx_wait_ns, rec_wait_ns, gfx_hold_ns; /* R79: lock time by thread */
+    /* R96: hang watchdog. The guest graphics call in progress, the thread's
+     * stack bounds, and a deep scan of its stack for return addresses. */
+    atomic_uint_fast64_t op_addr;
+    uint64_t stack_lo, stack_hi;
+    uint64_t hang_rip, hang_stack[48];
+    atomic_int hang_n;
 #endif
 } StatThread;
 static StatThread stat_threads[STAT_THREADS];
 static atomic_uint stat_thread_count;
 static _Thread_local StatThread *stat_thread;
+/* R96: which thread (StatThread id; 1 when it has none) holds each host lock. */
+static atomic_uint_fast64_t gfx_owner_id, rec_owner_id, kernel_owner_id;
+static atomic_int prof_hang_deep;
+static _Thread_local StatThread *lock_stats; /* R79: the replay worker's entry */
+static uint64_t lock_owner_tag(void)
+{
+    StatThread *entry = lock_stats ? lock_stats : stat_thread;
+    return entry ? (uint64_t)atomic_load_explicit(&entry->id, memory_order_relaxed) : 1;
+}
 static _Thread_local uint64_t stat_thread_left_svc;
 
 #if defined(__PROSPERO__)
@@ -719,6 +737,31 @@ static void prof_host_signal(int signal, siginfo_t *info, void *context)
     const ucontext_t *uc = context;
     const uint64_t rip = (uint64_t)uc->uc_mcontext.mc_rip;
     uint64_t caller = 0;
+    if (atomic_load_explicit(&prof_hang_deep, memory_order_relaxed)) {
+        /* R96: every word on the stack that is a return address into this
+         * module (the byte before it ends a call instruction). */
+        const uint64_t *stack = (const uint64_t *)uc->uc_mcontext.mc_rsp;
+        const uint64_t rsp = (uint64_t)uc->uc_mcontext.mc_rsp;
+        /* Only inside the thread's own recorded stack, and at most 64 KiB of it:
+         * an unbounded scan killed the process during boot loading stalls. */
+        uint64_t limit = 0;
+        if (thread->stack_lo <= rsp && rsp < thread->stack_hi)
+            limit = thread->stack_hi - rsp > 0x10000 ? rsp + 0x10000 : thread->stack_hi;
+        int n = 0;
+        for (const uint64_t *word = stack; (uint64_t)(word + 1) <= limit && n < 48 &&
+                                           word < stack + 0x40000 / sizeof *word; ++word) {
+            const uint64_t value = *word;
+            if (value < UINT64_C(0x400010) || value >= UINT64_C(0x11e00000))
+                continue;
+            const uint8_t *p = (const uint8_t *)value;
+            if (p[-5] == 0xe8 || (p[-2] == 0xff && ((p[-1] >> 3) & 7) == 2) ||
+                (p[-3] == 0xff && ((p[-2] >> 3) & 7) == 2) || (p[-6] == 0xff && ((p[-5] >> 3) & 7) == 2) ||
+                (p[-7] == 0xff && ((p[-6] >> 3) & 7) == 2))
+                thread->hang_stack[n++] = value;
+        }
+        thread->hang_rip = rip;
+        atomic_store_explicit(&thread->hang_n, n, memory_order_relaxed);
+    }
     if (rip >= UINT64_C(0x800000000) && !atomic_load_explicit(&prof_raw_pc_only, memory_order_relaxed)) {
         /* R76: in a system library (kernel call stubs): find who called it. */
         const uint64_t *stack = (const uint64_t *)uc->uc_mcontext.mc_rsp;
@@ -1052,6 +1095,66 @@ static bool prof_request_pc(StatThread *thread)
     return atomic_load_explicit(&thread->host_pc_ready, memory_order_acquire) != 0;
 }
 
+/* R96: the host stack bounds of the calling thread, for the deep scan. */
+static void stat_thread_stack_bounds(StatThread *thread)
+{
+    pthread_attr_t attr;
+    void *base = NULL;
+    size_t size = 0;
+    if (pthread_attr_init(&attr))
+        return;
+    if (!pthread_attr_get_np(pthread_self(), &attr) && !pthread_attr_getstack(&attr, &base, &size) && base) {
+        thread->stack_lo = (uint64_t)(uintptr_t)base;
+        thread->stack_hi = (uint64_t)(uintptr_t)base + size;
+    }
+    pthread_attr_destroy(&attr);
+}
+
+/* R96: frames stopped. Write every thread's state, the owner of each host
+ * lock and, for threads in host code, their stacks to ps5-hang.txt. Uses its
+ * own file: a thread stuck inside probe_log's lock must not stop the dump. */
+static void hang_dump(double stalled_s)
+{
+    FILE *out = fopen("/data/pokopia/ps5-hang.txt", "a");
+    if (!out)
+        return;
+    extern uint64_t pokopia_boot_monotonic_ns(void);
+    fprintf(out, "=== hang t=%.1fs no present for %.1fs anchor fatal_signal=%#" PRIx64 "\n",
+            pokopia_boot_monotonic_ns() * 1e-9, stalled_s, (uint64_t)(uintptr_t)fatal_signal);
+    fprintf(out, "owners gfx=%" PRIu64 " rec=%" PRIu64 " kernel=%" PRIu64 "\n",
+            (uint64_t)atomic_load(&gfx_owner_id), (uint64_t)atomic_load(&rec_owner_id),
+            (uint64_t)atomic_load(&kernel_owner_id));
+    const unsigned count = atomic_load_explicit(&stat_thread_count, memory_order_acquire);
+    for (unsigned i = 0; i < count && i < STAT_THREADS; ++i) {
+        StatThread *thread = &stat_threads[i];
+        const Ctx *ctx = atomic_load_explicit(&thread->ctx, memory_order_acquire);
+        const uint64_t op = atomic_load_explicit(&thread->op_addr, memory_order_relaxed);
+        const int in_host = atomic_load_explicit(&thread->in_host, memory_order_relaxed);
+        const int in_svc = atomic_load_explicit(&thread->in_svc, memory_order_relaxed);
+        const char *name = op && nvn ? nvn_front_call_name(nvn, op) : NULL;
+        fprintf(out, "t%" PRIu64 " host=%d svc=%#x op=%#" PRIx64 " %s fn=%#" PRIx64 " lr=%#" PRIx64,
+                (uint64_t)atomic_load(&thread->id), in_host, in_svc ? in_svc - 1 : 0, op, name ? name : "-",
+                ctx ? ctx->fn : 0, ctx ? ctx->x[30] : 0);
+        /* Only threads in host code, as the profiler samples them every
+         * millisecond: signalling threads blocked in system calls killed the
+         * process during a boot loading stall. */
+        if (ctx && in_host && thread->stack_hi) {
+            atomic_store_explicit(&thread->hang_n, -1, memory_order_relaxed);
+            atomic_store_explicit(&prof_hang_deep, 1, memory_order_relaxed);
+            const bool captured = prof_request_pc(thread);
+            atomic_store_explicit(&prof_hang_deep, 0, memory_order_relaxed);
+            const int n = atomic_load_explicit(&thread->hang_n, memory_order_relaxed);
+            if (captured && n >= 0) {
+                fprintf(out, " rip=%#" PRIx64 " stack", thread->hang_rip);
+                for (int k = 0; k < n; ++k)
+                    fprintf(out, " %#" PRIx64, thread->hang_stack[k]);
+            }
+        }
+        fputc('\n', out);
+    }
+    fclose(out);
+}
+
 #if defined(POKOPIA_GFX)
 /* The SVC owner publishes a unique token only inside its matching sleep.
  * All counters, PC slots and the selection cursor are owned by prof_main. */
@@ -1186,8 +1289,41 @@ static void *prof_main(void *unused)
     for (;;) {
         nanosleep(&(struct timespec){.tv_nsec = PROF_PERIOD_US * 1000L}, NULL);
         ++ticks;
-        if (ticks % 1000 == 0)
+        if (ticks % 16 == 0)
+            hzn_hid_ps4_refresh(); /* R96: keep rumble alive (the PS5 drops unrepeated values) */
+        if (ticks % 1000 == 0) {
             timeline_tick();
+            /* R96: rumble experiment. debug/rumble holds "kind mode" (see
+             * hzn_hid_ps4_rumble_mode); switch the pad's vibration mode, then
+             * pulse both motors at full strength for a second. */
+            FILE *rumble = fopen("/data/pokopia/debug/rumble", "r");
+            if (rumble) {
+                int kind = 0, mode = 0;
+                const int fields = fscanf(rumble, "%d %d", &kind, &mode);
+                fclose(rumble);
+                unlink("/data/pokopia/debug/rumble");
+                extern int hzn_hid_ps4_rumble_mode(int handle, int kind, int mode);
+                extern int hzn_hid_ps4_pulse(int handle, uint8_t strength);
+                const int set = fields >= 1 ? hzn_hid_ps4_rumble_mode(native_pad, kind, mode) : -1;
+                const int on = hzn_hid_ps4_pulse(native_pad, 255);
+                nanosleep(&(struct timespec){.tv_sec = 1}, NULL);
+                const int off = hzn_hid_ps4_pulse(native_pad, 0);
+                fprintf(probe_log, "Rumble test kind=%d mode=%d set=%#x pulse=%#x off=%#x pad=%d\n", kind, mode,
+                        (uint32_t)set, (uint32_t)on, (uint32_t)off, native_pad);
+                fflush(probe_log);
+            }
+            /* R96: hang watchdog. Once frames have started, four seconds with
+             * no present writes ps5-hang.txt (then again every 60 s, 5 times). */
+            static uint64_t seen_presents, stalled_ticks, dumps;
+            const uint64_t now_presents = atomic_load_explicit(&timeline_presents, memory_order_relaxed);
+            if (now_presents != seen_presents || !now_presents) {
+                seen_presents = now_presents;
+                stalled_ticks = 0;
+            } else if (++stalled_ticks == 4 || (stalled_ticks > 4 && stalled_ticks % 60 == 4 && dumps < 5)) {
+                ++dumps;
+                hang_dump(stalled_ticks * (PROF_PERIOD_US * 1000.0) * 1e-6);
+            }
+        }
         /* R94: debug flags bit 16 pauses sampling (a SIGUSR2 to a thread in
          * host code every millisecond, the replay worker nearly always). */
         if (pokopia_debug_flags & (1u << 16)) {
@@ -1489,6 +1625,7 @@ static void kernel_lock(void)
 #endif
     if (scope)
         scope->kernel_locked = true;
+    atomic_store_explicit(&kernel_owner_id, lock_owner_tag(), memory_order_relaxed);
 }
 
 static void kernel_unlock(void)
@@ -1496,6 +1633,7 @@ static void kernel_unlock(void)
     GuestBoundary *scope = pokopia_host_thread();
     if (scope)
         scope->kernel_locked = false;
+    atomic_store_explicit(&kernel_owner_id, 0, memory_order_relaxed);
 #ifndef _WIN32
     const uint64_t held = stat_now_ns() - stat_lock_acquired;
     STAT_ADD(stat_lock_hold_ns, held);
@@ -3002,6 +3140,46 @@ static bool execute_nvn_copy_texture(void *opaque, const NvnReplayTextureCopy *c
     return result == VK_SUCCESS;
 }
 
+/* R96: nvnCommandBufferCopyTextureToBuffer. Saving a Pokemon reads a
+ * 1920x1080 frame back into a buffer (its save thumbnail). */
+static bool execute_nvn_copy_to_buffer(void *opaque, uint64_t device, const NvnReplayTextureCopySide *side,
+                                       uint64_t buffer, uint64_t row_stride, uint64_t image_stride)
+{
+    static unsigned logged;
+    PokopiaVkTexture *texture = side->texture.native;
+    const uint32_t texel = pokopia_vk_texture_texel_bytes(texture);
+    VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    uint64_t bytes = 0;
+    if (texel && !side->volume && side->width > 0 && side->height > 0) {
+        const uint64_t packed_row = (uint64_t)side->width * texel;
+        const uint64_t row = row_stride ? row_stride : packed_row;
+        const uint64_t layer_bytes = row * ((uint64_t)side->height - 1) + packed_row;
+        const uint64_t image = image_stride ? image_stride : row * (uint64_t)side->height;
+        bytes = image * ((uint64_t)side->layers - 1) + layer_bytes;
+        NvnFrontPoolHit hit;
+        uint8_t *destination = row >= packed_row && bytes <= (UINT64_C(1) << 30) &&
+                               nvn_front_resolve_pool(nvn, device, buffer, (size_t)bytes, &hit) ?
+                               write_guest(NULL, buffer, (size_t)bytes) : NULL;
+        if (destination) {
+            if (texture->deferred || texture->layout == VK_IMAGE_LAYOUT_UNDEFINED)
+                pokopia_live_texture_prepare_sample(&texture_upload, &side->texture);
+            result = pokopia_vk_texture_read_region(opaque, texture, side->level, side->layer, side->layers,
+                                                    (VkOffset2D){side->x, side->y},
+                                                    (VkExtent2D){(uint32_t)side->width, (uint32_t)side->height},
+                                                    destination, (size_t)row, (size_t)image);
+        }
+    }
+    if (result != VK_SUCCESS || logged < 8) {
+        ++logged;
+        fprintf(probe_log, "NVN texture to buffer copy %dx%d+%d,%d fmt=%d L%u/%u+%u -> %#" PRIx64
+                           " row=%" PRIu64 " image=%" PRIu64 " bytes=%" PRIu64 " result=%d\n",
+                side->width, side->height, side->x, side->y, texture ? (int)texture->format : -1, side->level,
+                side->layer, side->layers, buffer, row_stride, image_stride, bytes, (int)result);
+        fflush(probe_log);
+    }
+    return result == VK_SUCCESS;
+}
+
 static bool execute_nvn_clear(void *opaque, void *object, VkRect2D area, const float rgba[4], uint32_t mask)
 {
     PokopiaVkTexture *texture = object;
@@ -3980,7 +4158,6 @@ static _Thread_local unsigned gfx_depth;
 uint64_t gfx_wait_ns, gfx_wait_count, gfx_yields;
 static _Atomic unsigned gfx_waiters;
 /* R79: per-thread lock accounting; the replay worker has no stat_thread. */
-static _Thread_local StatThread *lock_stats;
 static _Thread_local uint64_t gfx_since;
 static StatThread *lock_stat_entry(void)
 {
@@ -4033,12 +4210,14 @@ static void gfx_acquire(void)
         gfx_site_charge(waited);
     }
     gfx_since = stat_now_ns();
+    atomic_store_explicit(&gfx_owner_id, lock_owner_tag(), memory_order_relaxed);
 }
 static void gfx_release(void)
 {
     StatThread *entry = lock_stat_entry();
     if (entry)
         atomic_fetch_add_explicit(&entry->gfx_hold_ns, stat_now_ns() - gfx_since, memory_order_relaxed);
+    atomic_store_explicit(&gfx_owner_id, 0, memory_order_relaxed);
     pthread_mutex_unlock(&gfx_mutex);
 }
 static void gfx_lock(void)
@@ -4088,6 +4267,7 @@ static void rec_acquire(void)
         if (entry)
             atomic_fetch_add_explicit(&entry->rec_wait_ns, waited, memory_order_relaxed);
     }
+    atomic_store_explicit(&rec_owner_id, lock_owner_tag(), memory_order_relaxed);
 }
 static void rec_lock(void)
 {
@@ -4096,14 +4276,17 @@ static void rec_lock(void)
 }
 static void rec_unlock(void)
 {
-    if (rec_depth && --rec_depth == 0)
+    if (rec_depth && --rec_depth == 0) {
+        atomic_store_explicit(&rec_owner_id, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rec_mutex);
+    }
 }
 static unsigned rec_release_all(void)
 {
     const unsigned depth = rec_depth;
     if (depth) {
         rec_depth = 0;
+        atomic_store_explicit(&rec_owner_id, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rec_mutex);
     }
     return depth;
@@ -4289,6 +4472,7 @@ static void *replay_worker_main(void *unused)
             lock_stats = entry; /* R79 */
             atomic_store(&entry->id, 999);
             entry->host = pthread_self();
+            stat_thread_stack_bounds(entry); /* R96 */
             atomic_store_explicit(&entry->in_host, 1, memory_order_relaxed);
             atomic_store_explicit(&entry->ctx, &worker_ctx, memory_order_release);
         }
@@ -4499,13 +4683,19 @@ static bool dispatch_graphics(Ctx *context, uint64_t address)
     }
 #if defined(__PROSPERO__)
     StatThread *const host_stats = stat_thread;
-    if (host_stats)
+    uint64_t outer_op = 0;
+    if (host_stats) {
+        outer_op = atomic_load_explicit(&host_stats->op_addr, memory_order_relaxed); /* R96 */
+        atomic_store_explicit(&host_stats->op_addr, address, memory_order_relaxed);
         atomic_store_explicit(&host_stats->in_host, 1, memory_order_relaxed);
+    }
 #endif
     const bool handled = dispatch_graphics_inner(context, address);
 #if defined(__PROSPERO__)
-    if (host_stats)
+    if (host_stats) {
         atomic_store_explicit(&host_stats->in_host, 0, memory_order_relaxed);
+        atomic_store_explicit(&host_stats->op_addr, outer_op, memory_order_relaxed);
+    }
 #endif
     if (handled && timed) {
         const uint64_t ns = stat_now_ns() - start;
@@ -5077,7 +5267,19 @@ static uint32_t open_hid_vibration_list(void *opaque)
 static bool vibrate_hid_pad(void *opaque, float amplitude_low, float amplitude_high)
 {
     (void)opaque;
-    return hzn_hid_ps4_vibrate(native_pad, amplitude_low, amplitude_high);
+    const bool ok = hzn_hid_ps4_vibrate(native_pad, amplitude_low, amplitude_high);
+    /* R96: rumble diagnostics (the first 40 changes, then every failure up to 40 more). */
+    extern int hzn_hid_ps4_vibration_result;
+    static unsigned logged, failures, nonzero;
+    const bool felt = amplitude_low >= 0.005f || amplitude_high >= 0.005f;
+    if (logged < 10 || (felt && nonzero++ < 20) || (!ok && failures < 40)) {
+        ++logged;
+        failures += !ok;
+        fprintf(probe_log, "Rumble low=%.3f high=%.3f pad=%d result=%#x\n", amplitude_low, amplitude_high, native_pad,
+                (uint32_t)hzn_hid_ps4_vibration_result);
+        fflush(probe_log);
+    }
+    return ok;
 }
 #endif
 
@@ -5594,6 +5796,22 @@ static bool service_manager_svc(Ctx *context, uint32_t number)
         const HznHidReply reply = hzn_hid_send_sync(&hid_state, endpoint, &config, tls, 0x100);
         if (!reply.handled)
             stop("unsupported HID command", reply.command);
+        if (reply.command == 214) { /* R96: SendVibrationValues2 diagnostics */
+            extern unsigned hzn_hid_vibration_sends;
+            extern uint32_t hzn_hid_vibration_last_handle;
+            extern float hzn_hid_vibration_last_amplitude;
+            static unsigned logged;
+            if (logged < 30 || (logged < 60 && hzn_hid_vibration_last_amplitude > 0)) {
+                ++logged;
+                fprintf(probe_log, "Rumble send #%u handle=%#" PRIx32 " amplitude=%.3f devices=%zu",
+                        hzn_hid_vibration_sends, hzn_hid_vibration_last_handle, hzn_hid_vibration_last_amplitude,
+                        hid_state.vibration_device_count);
+                for (size_t i = 0; i < hid_state.vibration_device_count; ++i)
+                    fprintf(probe_log, " %#" PRIx32, hid_state.vibration_devices[i].handle);
+                fputc('\n', probe_log);
+                fflush(probe_log);
+            }
+        }
         update_guest_pad();
         context->x[0] = reply.result;
         return true;
@@ -5912,6 +6130,7 @@ void guest_svc(Ctx *context, uint32_t number)
             atomic_store(&stat_thread->id, hzn_thread_id(threads, context, 0xffff8000u));
 #if defined(__PROSPERO__)
             stat_thread->host = pthread_self();
+            stat_thread_stack_bounds(stat_thread); /* R96 */
             atomic_store_explicit(&stat_thread->ctx, context, memory_order_release);
             pthread_once(&prof_once, prof_start);
 #endif
@@ -6788,7 +7007,8 @@ int pokopia_guest_probe(FILE *log)
         .clear_depth_stencil = execute_nvn_clear_depth_stencil, .draw = execute_nvn_draw,
         .draw_generic = execute_nvn_draw_generic, .compute_generic = execute_nvn_compute_generic,
         .compute = execute_nvn_compute, .sync = execute_nvn_sync, .finish = finish_nvn_queue,
-        .copy_texture = execute_nvn_copy_texture, .timestamp_ns = pokopia_boot_monotonic_ns,
+        .copy_texture = execute_nvn_copy_texture, .copy_texture_to_buffer = execute_nvn_copy_to_buffer,
+        .timestamp_ns = pokopia_boot_monotonic_ns,
         .execute_begin = replay_execute_begin, .execute_end = replay_execute_end, .execute_yield = replay_execute_yield,
         .enqueue = replay_enqueue_job, .sync_queued = replay_sync_queued,
     };

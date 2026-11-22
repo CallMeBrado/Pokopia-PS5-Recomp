@@ -139,6 +139,10 @@ static HznHidReply vibration_device(HznHidState *state, uint8_t *tls, size_t siz
 
 _Static_assert(sizeof(HznHidVibrationValue) == 16, "VibrationValue ABI");
 
+unsigned hzn_hid_vibration_sends;
+uint32_t hzn_hid_vibration_last_handle;
+float hzn_hid_vibration_last_amplitude;
+
 static HznHidReply send_vibration_values(HznHidState *state, const HznHidConfig *config,
                                          uint8_t *tls, size_t size, const HznCmifRequest *request,
                                          HznGuestBuffer values_buffer)
@@ -166,6 +170,12 @@ static HznHidReply send_vibration_values(HznHidState *state, const HznHidConfig 
     if (!hzn_cmif_reply(tls, size, false, 0, NULL))
         return svc_result(INVALID_COMBINATION, command);
     bool local_changed = false;
+    ++hzn_hid_vibration_sends; /* R96: rumble diagnostics, logged by the loader */
+    if (count) {
+        hzn_hid_vibration_last_handle = handles[0];
+        hzn_hid_vibration_last_amplitude = values[0].amplitude_low > values[0].amplitude_high ?
+                                           values[0].amplitude_low : values[0].amplitude_high;
+    }
     for (size_t i = 0; i < count; ++i) {
         const uint32_t handle = handles[i] & 0x00ffffff;
         for (size_t slot = 0; slot < state->vibration_device_count; ++slot) {

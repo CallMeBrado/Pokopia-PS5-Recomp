@@ -71,6 +71,8 @@ int hzn_hid_ps4_open(void);
 extern bool hzn_hid_ps4_swap_ab;
 bool hzn_hid_ps4_read(int handle, HznHidPad *pad);
 bool hzn_hid_ps4_vibrate(int handle, float amplitude_low, float amplitude_high);
+/* R96: re-sends the current non-zero vibration (call every ~16 ms). */
+void hzn_hid_ps4_refresh(void);
 void hzn_hid_ps4_close(int handle);
 #endif
 

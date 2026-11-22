@@ -129,6 +129,14 @@ VkImageView pokopia_vk_texture_typed_view(PokopiaVkAdapter *adapter, PokopiaVkTe
 /* R73: debug readback of one level and layer to a raw "PDMP" file. */
 VkResult pokopia_vk_texture_dump(PokopiaVkAdapter *adapter, PokopiaVkTexture *texture, uint32_t level,
                                  uint32_t layer, const char *path);
+/* R96: bytes per texel of an uncompressed colour texture (0: not readable). */
+uint32_t pokopia_vk_texture_texel_bytes(const PokopiaVkTexture *texture);
+/* R96: reads a region of one level (layers [layer, layer+layers)) back into
+ * `destination`, rows `row_stride` bytes apart and layers `image_stride`
+ * apart, and waits. Leaves the texture in TRANSFER_SRC, as the dump does. */
+VkResult pokopia_vk_texture_read_region(PokopiaVkAdapter *adapter, PokopiaVkTexture *texture, uint32_t level,
+                                        uint32_t layer, uint32_t layers, VkOffset2D offset, VkExtent2D extent,
+                                        uint8_t *destination, size_t row_stride, size_t image_stride);
 /* Copies every level and layer of a texture into its feedback copy (made on
  * first use from the texture's config) and waits. NVN lets a draw sample the
  * texture it renders to; Vulkan draws sample the copy instead. */

@@ -1630,3 +1630,119 @@ VkResult pokopia_vk_texture_dump(PokopiaVkAdapter *adapter, PokopiaVkTexture *te
     }
     return result;
 }
+
+uint32_t pokopia_vk_texture_texel_bytes(const PokopiaVkTexture *texture)
+{
+    VkImageAspectFlags aspect;
+    if (!texture || (texture->format >= 131 && texture->format <= 146))
+        return 0;
+    const uint32_t texel = dump_texel_bytes(texture->format, &aspect);
+    return aspect == VK_IMAGE_ASPECT_COLOR_BIT ? texel : 0;
+}
+
+VkResult pokopia_vk_texture_read_region(PokopiaVkAdapter *adapter, PokopiaVkTexture *texture, uint32_t level,
+                                        uint32_t layer, uint32_t layers, VkOffset2D offset, VkExtent2D extent,
+                                        uint8_t *destination, size_t row_stride, size_t image_stride)
+{
+    const uint32_t texel = pokopia_vk_texture_texel_bytes(texture);
+    if (!adapter || !texture || !texture->backing.image || texture->deferred || !texel || !destination ||
+        !extent.width || !extent.height || !layers || row_stride < (size_t)extent.width * texel ||
+        (layers > 1 && image_stride < row_stride * (extent.height - 1) + (size_t)extent.width * texel))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    /* Never rendered or uploaded: nothing newer than the guest bytes. */
+    if (texture->layout == VK_IMAGE_LAYOUT_UNDEFINED)
+        return VK_SUCCESS;
+    const VkDevice device = adapter->device;
+    const PFN_vkGetDeviceProcAddr proc = adapter->get_device_proc;
+#define LOAD(name) PFN_vk##name name = (PFN_vk##name)proc(device, "vk" #name); if (!name) return VK_ERROR_INITIALIZATION_FAILED;
+    LOAD(CreateBuffer) LOAD(DestroyBuffer) LOAD(GetBufferMemoryRequirements) LOAD(AllocateMemory) LOAD(FreeMemory)
+    LOAD(BindBufferMemory) LOAD(MapMemory) LOAD(UnmapMemory) LOAD(BeginCommandBuffer) LOAD(EndCommandBuffer)
+    LOAD(CmdPipelineBarrier) LOAD(CmdCopyImageToBuffer)
+#undef LOAD
+    const size_t packed_row = (size_t)extent.width * texel, packed_layer = packed_row * extent.height;
+    const VkDeviceSize bytes = (VkDeviceSize)packed_layer * layers;
+    const VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult result = CreateBuffer(device, &buffer_info, NULL, &buffer);
+    if (result != VK_SUCCESS)
+        return result;
+    VkMemoryRequirements needs;
+    GetBufferMemoryRequirements(device, buffer, &needs);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < adapter->memory.memoryTypeCount && type == UINT32_MAX; ++i)
+        if ((needs.memoryTypeBits & (1u << i)) &&
+            (adapter->memory.memoryTypes[i].propertyFlags &
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            type = i;
+    const VkMemoryAllocateInfo alloc = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = needs.size, .memoryTypeIndex = type,
+    };
+    result = type == UINT32_MAX ? VK_ERROR_FEATURE_NOT_PRESENT
+                                : pokopia_vk_ledger_allocate(AllocateMemory, device, &alloc, &memory, VK_LEDGER_DOWNLOAD);
+    if (result == VK_SUCCESS)
+        result = BindBufferMemory(device, buffer, memory, 0);
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (result == VK_SUCCESS)
+        result = pokopia_vk_command_buffer_open(adapter, &command);
+    bool retired = true;
+    if (result == VK_SUCCESS) {
+        const VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        result = BeginCommandBuffer(command, &begin);
+        if (result == VK_SUCCESS) {
+            const VkImageMemoryBarrier to_source = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = texture->access, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .oldLayout = texture->layout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = texture->backing.image,
+                .subresourceRange = {texture->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS},
+            };
+            CmdPipelineBarrier(command, texture->stages ? texture->stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_source);
+            const VkBufferImageCopy region = {
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, layers},
+                .imageOffset = {offset.x, offset.y, 0}, .imageExtent = {extent.width, extent.height, 1},
+            };
+            CmdCopyImageToBuffer(command, texture->backing.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1,
+                                 &region);
+            const VkBufferMemoryBarrier host = {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = buffer, .size = VK_WHOLE_SIZE,
+            };
+            CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1,
+                               &host, 0, NULL);
+            result = EndCommandBuffer(command);
+        }
+        if (result == VK_SUCCESS)
+            result = pokopia_vk_submit_wait(adapter, command, &retired);
+        if (retired)
+            pokopia_vk_command_buffer_close(adapter, command);
+    }
+    if (result == VK_SUCCESS) {
+        texture->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        texture->stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        texture->access = VK_ACCESS_TRANSFER_READ_BIT;
+        void *mapped = NULL;
+        result = MapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped);
+        if (result == VK_SUCCESS) {
+            for (uint32_t l = 0; l < layers; ++l)
+                for (uint32_t row = 0; row < extent.height; ++row)
+                    memcpy(destination + l * image_stride + row * row_stride,
+                           (const uint8_t *)mapped + l * packed_layer + row * packed_row, packed_row);
+            UnmapMemory(device, memory);
+        }
+    }
+    if (retired) {
+        if (memory)
+            pokopia_vk_ledger_free(FreeMemory, device, memory);
+        DestroyBuffer(device, buffer, NULL);
+    }
+    return result;
+}

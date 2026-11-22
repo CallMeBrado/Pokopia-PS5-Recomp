@@ -58,6 +58,12 @@ typedef struct {
     bool (*compute_generic)(void *opaque, const PokopiaGenericCompute *dispatch);
     /* NULL, or false on execution, skips the copy (counted) instead of stopping. */
     bool (*copy_texture)(void *opaque, const NvnReplayTextureCopy *copy);
+    /* R96: nvnCommandBufferCopyTextureToBuffer: read the source region back
+     * into guest memory at `buffer` (a pool address on `device`), rows
+     * `row_stride` bytes apart and layers `image_stride` apart (0: packed).
+     * NULL, or false on execution, skips the copy (counted). */
+    bool (*copy_texture_to_buffer)(void *opaque, uint64_t device, const NvnReplayTextureCopySide *source,
+                                   uint64_t buffer, uint64_t row_stride, uint64_t image_stride);
     bool (*sync)(void *opaque, void *sync, bool wait);
     bool (*finish)(void *opaque);
     uint64_t (*timestamp_ns)(void);

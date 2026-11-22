@@ -102,8 +102,17 @@ typedef struct {
     NvnReplayTextureCopy copy;
 } TextureCopy;
 
+/* R96: nvnCommandBufferCopyTextureToBuffer, with the copy strides current at
+ * record time (nvnCommandBufferSetCopyRowStride / SetCopyImageStride). */
+typedef struct {
+    uint64_t texture, buffer, row_stride, image_stride;
+    void *native;
+    NvnReplayTextureCopySide side;
+} TextureBufferCopy;
+
 typedef enum {
     OP_COPY, OP_CLEAR, OP_DEPTH_CLEAR, OP_DRAW, OP_DISPATCH, OP_SYNC, OP_TIMESTAMP, OP_COPY_TEXTURE,
+    OP_COPY_TO_BUFFER,
 } OperationKind;
 
 typedef struct {
@@ -117,6 +126,7 @@ typedef struct {
         Sync sync;
         uint64_t timestamp_address;
         TextureCopy copy_texture;
+        TextureBufferCopy copy_to_buffer;
     } data;
 } Operation;
 
@@ -148,6 +158,7 @@ typedef struct Recording {
     uint32_t color_write_masks, blend_mask; /* R63: all eight targets */
     uint32_t raster_bound;
     uint32_t patch_size, depth_func;
+    uint64_t copy_row_stride, copy_image_stride; /* R96 */
     NvnFrontBlendInfo blend;
     float polygon_offset[3];
     NvnFrontStencilInfo stencil_faces[2];
@@ -229,11 +240,12 @@ static size_t operation_payload_size(OperationKind kind)
         [OP_SYNC] = sizeof(Sync),
         [OP_TIMESTAMP] = sizeof(uint64_t),
         [OP_COPY_TEXTURE] = sizeof(TextureCopy),
+        [OP_COPY_TO_BUFFER] = sizeof(TextureBufferCopy),
     };
     return (unsigned)kind < sizeof sizes / sizeof sizes[0] ? sizes[kind] : 0;
 }
 
-_Static_assert(OP_COPY_TEXTURE <= UINT8_MAX, "recorded operation kind must fit in one byte");
+_Static_assert(OP_COPY_TO_BUFFER <= UINT8_MAX, "recorded operation kind must fit in one byte");
 
 /* Only draws need aligned payloads. The replay reads those directly and keeps
  * the smaller command types packed. malloc and realloc align the stream base. */
@@ -1676,6 +1688,82 @@ static NvnFrontReplyKind record_copy_texture(NvnReplay *replay, const uint64_t x
     copy->destination_native = to->texture.native;
     copy->copy.linear = (flags & COPY_LINEAR_FILTER) != 0;
     return append_metered(replay, recording, &operation, command_bytes, control_bytes);
+}
+
+/* R96: nvnCommandBufferSetCopyRowStride / SetCopyImageStride: the buffer
+ * layout of later texture<->buffer copies (0: tightly packed). */
+static NvnFrontReplyKind set_copy_stride(NvnReplay *replay, const uint64_t x[32], bool image)
+{
+    Recording *recording = *find_recording(replay, x[0]);
+    if (!recording)
+        return NVN_FRONT_INVALID_GUEST;
+    if (!charge_recording(replay, recording, 8, 0))
+        return NVN_FRONT_BOUNDARY;
+    if (image)
+        recording->copy_image_stride = x[1];
+    else
+        recording->copy_row_stride = x[1];
+    return NVN_FRONT_HANDLED;
+}
+
+/* R96: nvnCommandBufferCopyTextureToBuffer(cmd, texture, view, region, buffer
+ * address, flags). Saving a Pokemon reads a 1920x1080 frame back for its save
+ * thumbnail. nvnCommandBufferCopyBufferToTexture is still skipped (counted). */
+static NvnFrontReplyKind record_copy_to_buffer(NvnReplay *replay, const uint64_t x[32], bool to_buffer)
+{
+    Recording *recording = *find_recording(replay, x[0]);
+    if (!recording)
+        return NVN_FRONT_INVALID_GUEST;
+    NvnFrontCommandBufferInfo command;
+    if (!nvn_front_get_command_buffer(replay->config.front, x[0], &command))
+        return NVN_FRONT_INVALID_GUEST;
+    const bool control = command.recording_mode == 1 || command.recording_mode == 4;
+    const size_t command_bytes = control ? 0 : COPY_TEXTURE_COMMAND_BYTES + (command.recording_mode <= 4 ? 8 : 0);
+    const size_t control_bytes = control ? COPY_TEXTURE_CONTROL_BYTES : 0;
+    Operation operation = {.kind = OP_COPY_TO_BUFFER};
+    TextureBufferCopy *copy = &operation.data.copy_to_buffer;
+    const char *reason = NULL;
+    if (!to_buffer) {
+        reason = "copy buffer to texture: not supported";
+    } else {
+        if (!resolve_copy_side(replay, recording->device, x[1], x[2], x[3], &copy->side, &reason))
+            return NVN_FRONT_INVALID_GUEST;
+        if (!reason && ((uint32_t)x[5] & COPY_MIRROR_MASK))
+            reason = "copy texture to buffer: mirrored copy";
+        if (!reason && !replay->config.copy_texture_to_buffer)
+            reason = "copy texture to buffer: no host callback";
+    }
+    const bool empty = !reason && (!copy->side.width || !copy->side.height || !copy->side.depth);
+    if (reason || empty) {
+        if (!charge_recording(replay, recording, command_bytes, control_bytes))
+            return NVN_FRONT_BOUNDARY;
+        if (reason) {
+            ++skip_counts[SKIP_COPY];
+            note_skip(reason);
+        }
+        return NVN_FRONT_HANDLED;
+    }
+    copy->texture = x[1];
+    copy->native = copy->side.texture.native;
+    copy->buffer = x[4];
+    copy->row_stride = recording->copy_row_stride;
+    copy->image_stride = recording->copy_image_stride;
+    return append_metered(replay, recording, &operation, command_bytes, control_bytes);
+}
+
+static NvnFrontReplyKind run_copy_to_buffer(NvnReplay *replay, uint64_t device, const TextureBufferCopy *recorded,
+                                            bool execute)
+{
+    NvnReplayTextureCopySide side = recorded->side;
+    if (!nvn_front_get_texture(replay->config.front, recorded->texture, &side.texture) ||
+        side.texture.native != recorded->native)
+        return NVN_FRONT_INVALID_GUEST;
+    if (execute && !replay->config.copy_texture_to_buffer(replay->config.opaque, device, &side, recorded->buffer,
+                                                          recorded->row_stride, recorded->image_stride)) {
+        ++skip_counts[SKIP_COPY];
+        note_skip("copy texture to buffer: host copy failed");
+    }
+    return NVN_FRONT_HANDLED;
 }
 
 static NvnFrontReplyKind run_copy_texture(NvnReplay *replay, const TextureCopy *recorded, bool execute)
@@ -3446,6 +3534,11 @@ static NvnFrontReplyKind run_operation(NvnReplay *replay, uint64_t device, const
         ++pokopia_vk_guest_write_epoch;
     if (operation->kind == OP_COPY_TEXTURE)
         return run_copy_texture(replay, &operation->data.copy_texture, execute);
+    if (operation->kind == OP_COPY_TO_BUFFER) {
+        if (execute)
+            ++pokopia_vk_guest_write_epoch; /* guest memory changes */
+        return run_copy_to_buffer(replay, device, &operation->data.copy_to_buffer, execute);
+    }
     if (operation->kind == OP_DRAW)
         return run_draw(replay, device, &operation->data.draw, execute);
     if (operation->kind == OP_DISPATCH)
@@ -3795,6 +3888,14 @@ NvnFrontReplyKind nvn_replay_dispatch_keyed(NvnReplay *replay, const char *name,
         return record_copy(replay, x);
     if (!strcmp(name, "nvnCommandBufferCopyTextureToTexture"))
         return record_copy_texture(replay, x);
+    if (!strcmp(name, "nvnCommandBufferSetCopyRowStride"))
+        return set_copy_stride(replay, x, false);
+    if (!strcmp(name, "nvnCommandBufferSetCopyImageStride"))
+        return set_copy_stride(replay, x, true);
+    if (!strcmp(name, "nvnCommandBufferCopyTextureToBuffer"))
+        return record_copy_to_buffer(replay, x, true);
+    if (!strcmp(name, "nvnCommandBufferCopyBufferToTexture"))
+        return record_copy_to_buffer(replay, x, false);
     if (!strcmp(name, "nvnCommandBufferReportCounter"))
         return record_timestamp(replay, x);
     if (!strcmp(name, "nvnCommandBufferSetRenderTargets"))
@@ -3899,6 +4000,12 @@ NvnFrontReplyKind nvn_replay_dispatch_keyed(NvnReplay *replay, const char *name,
         if (!x[1])
             return NVN_FRONT_INVALID_GUEST;
         RecordedList **link = find_list(replay, x[1]);
+        /* R96: a handle this replay issued whose list the cache has already
+         * evicted (R63) has nothing left to free. The game finalizes some long-
+         * lived lists much later (saving a Pokemon freed handle 0x7f10000010
+         * after ~1.2M evictions), and treating that as invalid stopped the game. */
+        if (!*link && x[1] >= UINT64_C(0x7f10000000) && x[1] < replay->next_handle && !(x[1] & 7))
+            return NVN_FRONT_HANDLED;
         if (!*link || (*link)->device != x[0])
             return NVN_FRONT_INVALID_GUEST;
         if (__atomic_load_n(&(*link)->pinned, __ATOMIC_ACQUIRE)) {
