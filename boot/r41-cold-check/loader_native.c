@@ -223,6 +223,81 @@ static PokopiaLivePresent live_output;
 static _Atomic bool osk_active;
 static HznHidPad osk_pad;
 static pthread_mutex_t pad_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* R92: the port settings menu. Holding the touch pad (Minus) for a second
+ * opens it; the game sees a neutral pad while it is open and until the
+ * buttons that closed it are released. Its state belongs to pad_mutex; the
+ * replay worker draws it at present when menu_dirty is set. */
+#define PORT_SETTINGS_PATH "/data/pokopia/port-settings.ini"
+static PokopiaMenu port_menu;
+static bool menu_open, menu_release_wait;
+static uint64_t menu_touch_since_ms, menu_previous;
+static atomic_bool menu_dirty;
+static atomic_flag port_settings_loaded = ATOMIC_FLAG_INIT;
+
+static void apply_port_settings(const PokopiaSettings *values)
+{
+    const bool glyphs = values->prompts != pokopia_settings.prompts || values->confirm != pokopia_settings.confirm;
+    pokopia_settings = *values;
+    hzn_hid_ps4_swap_ab = values->confirm == POKOPIA_CONFIRM_CROSS;
+    if (glyphs)
+        atomic_fetch_add_explicit(&pokopia_glyph_generation, 1, memory_order_relaxed);
+}
+
+static void port_settings_once(void)
+{
+    if (atomic_flag_test_and_set_explicit(&port_settings_loaded, memory_order_acq_rel))
+        return;
+    PokopiaSettings loaded;
+    pokopia_settings_load(&loaded, PORT_SETTINGS_PATH);
+    pokopia_settings = loaded;
+    hzn_hid_ps4_swap_ab = loaded.confirm == POKOPIA_CONFIRM_CROSS;
+}
+
+static uint64_t stat_now_ns(void);
+/* Called with pad_mutex held, on the pad as the guest would see it. */
+static void port_menu_pad(HznHidPad *pad)
+{
+    const uint64_t now_ms = stat_now_ns() / 1000000;
+    if (!menu_open && !atomic_load_explicit(&osk_active, memory_order_acquire)) {
+        if (!menu_release_wait && (pad->buttons & POKOPIA_OSK_MINUS)) {
+            if (!menu_touch_since_ms) {
+                menu_touch_since_ms = now_ms ? now_ms : 1;
+            } else if (now_ms - menu_touch_since_ms >= 1000) {
+                pokopia_menu_init(&port_menu, &pokopia_settings);
+                menu_open = true;
+                menu_previous = pad->buttons; /* the held touch pad does not count */
+                menu_touch_since_ms = 0;
+                atomic_store_explicit(&menu_dirty, true, memory_order_release);
+                fprintf(probe_log, "Port menu opened\n");
+            }
+        } else {
+            menu_touch_since_ms = 0;
+        }
+    }
+    if (menu_open) {
+        bool changed = false;
+        const PokopiaMenuState state =
+            pokopia_menu_input(&port_menu, pad->buttons, menu_previous, pad->lx, pad->ly, now_ms, &changed);
+        menu_previous = pad->buttons;
+        if (changed) {
+            apply_port_settings(&port_menu.values);
+            atomic_store_explicit(&menu_dirty, true, memory_order_release);
+        }
+        if (state == POKOPIA_MENU_CLOSED) {
+            menu_open = false;
+            menu_release_wait = true;
+            const bool saved = pokopia_settings_save(&pokopia_settings, PORT_SETTINGS_PATH);
+            fprintf(probe_log, "Port menu closed; settings %s\n", saved ? "saved" : "NOT saved");
+            atomic_store_explicit(&menu_dirty, true, memory_order_release);
+        }
+    }
+    if (menu_release_wait && !menu_open && !pad->buttons)
+        menu_release_wait = false;
+    if (menu_open || menu_release_wait) {
+        pad->buttons = 0;
+        pad->lx = pad->ly = pad->rx = pad->ry = 0;
+    }
+}
 static struct {
     PokopiaVkTexture *texture;
     VkExtent2D extent;
@@ -352,6 +427,8 @@ static void update_guest_pad(void)
     }
 #endif
 #if defined(__PROSPERO__)
+    port_settings_once();
+    port_menu_pad(&pad);
     if (atomic_load_explicit(&osk_active, memory_order_acquire)) {
         osk_pad = pad;
         pad.buttons = 0;
@@ -3004,6 +3081,18 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32]);
 static NvnFrontReplyKind present_nvn_frame(const uint64_t x[32])
 {
     update_guest_pad();
+    /* R92: the port menu's 30 fps cap. The game thread sleeps after this
+     * present until 33 ms after the last one (dispatch_graphics), so FIFO
+     * presentation shows each frame for two vblanks. */
+    if (pokopia_settings.frame_cap == 30) {
+        static uint64_t cap_due;
+        const uint64_t now = stat_now_ns(), frame = UINT64_C(33000000);
+        if (cap_due > now) {
+            present_pace_until = cap_due;
+            STAT_ADD(stat_paced_frames, 1);
+        }
+        cap_due = (cap_due > now ? cap_due : now) + frame;
+    }
     if (replay_worker_running) {
         NvnFrontQueueInfo queue;
         NvnWindowInfo window;
@@ -3086,6 +3175,26 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
                 fprintf(probe_log, "Live FPS counter unavailable (%d)\n", (int)fps_result);
                 fflush(probe_log);
             }
+        }
+    }
+    /* R92: port settings: overlays shown or hidden, the menu drawn when it changed. */
+    live_output.fps_hidden = !pokopia_settings.fps_counter;
+    live_output.overlay_hidden = !pokopia_settings.debug_info;
+    if (atomic_exchange_explicit(&menu_dirty, false, memory_order_acq_rel) && live_output.present) {
+        pthread_mutex_lock(&pad_mutex);
+        const PokopiaMenu menu = port_menu;
+        const bool open = menu_open;
+        pthread_mutex_unlock(&pad_mutex);
+        uint8_t *menu_pixels = NULL;
+        bool menu_bgra = false;
+        const uint32_t menu_w = live_output.present->extent.width * 1600 / 3840;
+        const uint32_t menu_h = menu_w * 1300 / 1600;
+        if (open && pokopia_live_present_menu_pixels(&live_output, menu_w, menu_h, &menu_pixels, &menu_bgra) == VK_SUCCESS) {
+            pokopia_menu_draw(&menu, menu_pixels, menu_w, menu_h, menu_bgra);
+            pokopia_live_present_menu_flush(&live_output);
+            live_output.menu_visible = true;
+        } else {
+            live_output.menu_visible = false;
         }
     }
     VkResult result = pokopia_live_present_frame(&live_output, &frame, UINT64_C(5000000000), &shot);
@@ -3846,6 +3955,7 @@ static bool dispatch_graphics_inner(Ctx *context, uint64_t address)
         {
             extern void *(*nvn_replay_volume_placeholder)(const NvnFrontTextureConfig *, uint32_t);
             nvn_replay_volume_placeholder = volume_placeholder;
+            port_settings_once(); /* R92 */
             extern PokopiaVkTexture *(*nvn_replay_texel_placeholder)(uint64_t);
             nvn_replay_texel_placeholder = texel_placeholder;
             extern void (*pokopia_vk_program_missing_hook)(const NvnFrontShaderData *, const char *);

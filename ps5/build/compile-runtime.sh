@@ -17,7 +17,7 @@ c_sources=(
    horizon/thread.c horizon/event.c horizon/key_sync.c boot/r41-cold-check/boot_budget.c boot/host.c
    gfx-bridge/vk_adapter.c gfx-bridge/vk_copy.c gfx-bridge/vk_program.c gfx-bridge/vk_texel.c
    gfx-bridge/vi_adapter.c gfx-bridge/nvn_front.c gfx-bridge/nvn_window.c gfx-bridge/nvn_replay.c
-   gfx-bridge/shader_cache.c gfx-bridge/texture_upload.c gfx-bridge/live_texture_upload.c gfx-bridge/osk.c
+   gfx-bridge/shader_cache.c gfx-bridge/texture_upload.c gfx-bridge/live_texture_upload.c gfx-bridge/osk.c gfx-bridge/port_settings.c
    gfx-bridge/live_draw.c gfx-bridge/live_compute.c gfx-bridge/live_present.c gfx-bridge/game_capture.c
    gfx-bridge/fsp.c gfx-bridge/romfs.c gfx-bridge/account.c gfx-bridge/orbis_memory.c
    ps5/compat/vkloader/vkloader.c ps5/compat/vkloader/vkthunks.c ps5/compat/cold_disabled.c

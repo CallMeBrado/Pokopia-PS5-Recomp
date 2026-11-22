@@ -25,6 +25,8 @@ static int32_t stick_axis(uint8_t raw)
     return (delta * 32767) / (delta < 0 ? 128 : 127);
 }
 
+bool hzn_hid_ps4_swap_ab;
+
 bool hzn_hid_ps4_read(int handle, HznHidPad *pad)
 {
     if (!pad)
@@ -49,6 +51,11 @@ bool hzn_hid_ps4_read(int handle, HznHidPad *pad)
     for (unsigned i = 0; i < sizeof buttons / sizeof buttons[0]; ++i)
         if (data.buttons & buttons[i])
             pad->buttons |= UINT64_C(1) << i;
+    if (hzn_hid_ps4_swap_ab) {
+        /* R92: swap the A and B bits (Circle and Cross). */
+        const uint64_t a = pad->buttons & 1, b = (pad->buttons >> 1) & 1;
+        pad->buttons = (pad->buttons & ~UINT64_C(3)) | (a << 1) | b;
+    }
     pad->lx = stick_axis(data.leftStick.x);
     pad->ly = -stick_axis(data.leftStick.y);
     pad->rx = stick_axis(data.rightStick.x);

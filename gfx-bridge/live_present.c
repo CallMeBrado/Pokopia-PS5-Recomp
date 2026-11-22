@@ -2,6 +2,7 @@
 #include "live_present.h"
 #include "vk_ledger.h"
 #include "fsr_shaders.h"
+#include "port_settings.h"
 
 #include <math.h>
 #include <string.h>
@@ -285,6 +286,37 @@ VkResult pokopia_live_present_keyboard_flush(PokopiaLivePresent *live)
         return VK_SUCCESS;
     const VkMappedMemoryRange range = {
         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = live->keyboard_memory, .size = VK_WHOLE_SIZE,
+    };
+    return vkFlushMappedMemoryRanges(live->present->device, 1, &range);
+}
+
+VkResult pokopia_live_present_menu_pixels(PokopiaLivePresent *live, uint32_t width, uint32_t height,
+    uint8_t **pixels, bool *bgra)
+{
+    if (!live || !live->present || !pixels || !bgra || !width || !height || width > live->present->extent.width ||
+        height > live->present->extent.height)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!live->menu_pixels) {
+        const VkResult result = open_panel(live, (VkDeviceSize)width * height * 4, &live->menu_buffer,
+            &live->menu_memory, &live->menu_pixels, &live->menu_coherent);
+        if (result != VK_SUCCESS)
+            return result;
+        live->menu_width = width;
+        live->menu_height = height;
+    } else if (live->menu_width != width || live->menu_height != height) {
+        return VK_ERROR_INITIALIZATION_FAILED; /* sized once */
+    }
+    *pixels = live->menu_pixels;
+    *bgra = live->present->format == VK_FORMAT_B8G8R8A8_UNORM || live->present->format == VK_FORMAT_B8G8R8A8_SRGB;
+    return VK_SUCCESS;
+}
+
+VkResult pokopia_live_present_menu_flush(PokopiaLivePresent *live)
+{
+    if (!live || !live->menu_pixels || live->menu_coherent)
+        return VK_SUCCESS;
+    const VkMappedMemoryRange range = {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = live->menu_memory, .size = VK_WHOLE_SIZE,
     };
     return vkFlushMappedMemoryRanges(live->present->device, 1, &range);
 }
@@ -695,7 +727,7 @@ static bool fsr_record(PokopiaLivePresent *live, VkCommandBuffer command, const 
         fsr_srgb(frame->format) ? 1u : 0u, 0, 0, 0,
     };
     /* FsrRcasCon: sharpness in stops below maximum (AMD's samples use 0.2). */
-    const uint32_t rcas[4] = {fsr_bits(exp2f(-0.25f)), 0, 0, 0};
+    const uint32_t rcas[4] = {fsr_bits(exp2f(-pokopia_settings_rcas_stops(pokopia_settings.sharpness))), 0, 0, 0};
 
     const VkPipelineStageFlags compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     const VkPipelineStageFlags transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -781,7 +813,8 @@ VkResult pokopia_live_present_frame(PokopiaLivePresent *live, const PokopiaLiveF
     }
 
     const bool scale = !same_extent(crop.extent, present->extent);
-    const bool use_fsr = fsr_prepare(live, frame, crop, scale);
+    /* R92: the port menu can pick plain bilinear scaling instead of FSR 1. */
+    const bool use_fsr = pokopia_settings.upscaler == POKOPIA_UPSCALER_FSR && fsr_prepare(live, frame, crop, scale);
     const bool transform = !use_fsr && (scale || frame->flip_y || channel_swap ||
         (srgb_pair && srgb_of_scanout(present->format) != frame->format));
     if (transform) {
@@ -836,9 +869,14 @@ VkResult pokopia_live_present_frame(PokopiaLivePresent *live, const PokopiaLiveF
             (VkDeviceSize)live->keyboard_width * live->keyboard_top * 4, 0,
             (int32_t)(present->extent.height - live->keyboard_bottom), live->keyboard_width, live->keyboard_bottom);
     }
-    if (live->overlay_ready)
+    if (live->menu_visible && live->menu_buffer && live->menu_width <= present->extent.width &&
+        live->menu_height <= present->extent.height)
+        record_panel_at(command, target.image, live->menu_buffer, 0,
+            (int32_t)(present->extent.width - live->menu_width) / 2,
+            (int32_t)(present->extent.height - live->menu_height) / 2, live->menu_width, live->menu_height);
+    if (live->overlay_ready && !live->overlay_hidden)
         record_overlay(command, target.image, live->overlay_buffer);
-    if (live->fps_ready)
+    if (live->fps_ready && !live->fps_hidden)
         record_panel(command, target.image, live->fps_buffer,
             (int32_t)(present->extent.width - OVERLAY_INSET - POKOPIA_FPS_WIDTH), OVERLAY_INSET,
             POKOPIA_FPS_WIDTH, POKOPIA_FPS_HEIGHT);

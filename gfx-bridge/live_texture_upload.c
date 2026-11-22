@@ -5,6 +5,7 @@
 #include "vk_flush.h"
 #include "ps_button_glyphs.h"
 #include "ps_title_glyphs.h"
+#include "port_settings.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -397,8 +398,32 @@ typedef struct {
     const uint8_t *blocks;
 } GlyphPatch;
 
-static uint8_t *ps_glyph_patch(VkFormat format, VkExtent2D extent, uint32_t mip, uint32_t layers,
-                               const uint8_t *linear, size_t bytes)
+/* R92: the textures that carry button glyphs, kept so a change of the
+ * prompts or confirm setting can upload them again from the game's bytes
+ * (pokopia_live_texture_prepare_sample). */
+static struct {
+    const PokopiaVkTexture *texture;
+    bool stale;
+} glyph_textures[4];
+static unsigned glyph_seen_generation;
+static void texture_forget(void *texture);
+
+static void glyph_texture_seen(const PokopiaVkTexture *texture)
+{
+    for (unsigned i = 0; i < 4; ++i)
+        if (glyph_textures[i].texture == texture)
+            return;
+    for (unsigned i = 0; i < 4; ++i)
+        if (!glyph_textures[i].texture) {
+            glyph_textures[i].texture = texture;
+            glyph_textures[i].stale = false;
+            pokopia_vk_texture_forget_hook = texture_forget;
+            return;
+        }
+}
+
+static uint8_t *ps_glyph_patch(const PokopiaVkTexture *texture, VkFormat format, VkExtent2D extent, uint32_t mip,
+                               uint32_t layers, const uint8_t *linear, size_t bytes)
 {
     enum { BLOCK = 16, ROW_BLOCKS = PS_GLYPH_ATLAS_SIZE / 4 };
     _Static_assert(PS_GLYPH_ATLAS_SIZE == PS_TITLE_TEXTURE_SIZE, "both patched textures are 1024x1024");
@@ -407,20 +432,34 @@ static uint8_t *ps_glyph_patch(VkFormat format, VkExtent2D extent, uint32_t mip,
         bytes != (size_t)ROW_BLOCKS * ROW_BLOCKS * BLOCK)
         return NULL;
     const uint64_t hash = glyph_atlas_hash(linear, bytes);
-    const void *table;
+    if (hash != PS_GLYPH_ATLAS_HASH && hash != PS_TITLE_TEXTURE_HASH)
+        return NULL;
+    glyph_texture_seen(texture);
+    /* R92: Nintendo prompts keep the game's own glyphs. */
+    if (pokopia_settings.prompts == POKOPIA_PROMPTS_NINTENDO)
+        return NULL;
+    const bool cross = pokopia_settings.confirm == POKOPIA_CONFIRM_CROSS;
+    _Static_assert(sizeof ps_glyph_patches[0] == sizeof(GlyphPatch) && sizeof ps_title_patches[0] == sizeof(GlyphPatch) &&
+                       sizeof ps_title_patches_cross[0] == sizeof(GlyphPatch),
+                   "patch tables share one layout");
+    GlyphPatch atlas[sizeof ps_glyph_patches / sizeof ps_glyph_patches[0]];
+    const GlyphPatch *patches;
     size_t count;
     if (hash == PS_GLYPH_ATLAS_HASH) {
-        table = ps_glyph_patches;
-        count = sizeof ps_glyph_patches / sizeof ps_glyph_patches[0];
-    } else if (hash == PS_TITLE_TEXTURE_HASH) {
-        table = ps_title_patches;
-        count = sizeof ps_title_patches / sizeof ps_title_patches[0];
+        memcpy(atlas, ps_glyph_patches, sizeof atlas);
+        count = sizeof atlas / sizeof atlas[0];
+        /* The first two are A (right) and B (bottom), both 68x68: with Cross
+         * confirming, A shows Cross and B shows Circle. */
+        if (cross) {
+            const uint8_t *a = atlas[0].blocks;
+            atlas[0].blocks = atlas[1].blocks;
+            atlas[1].blocks = a;
+        }
+        patches = atlas;
     } else {
-        return NULL;
+        patches = (const GlyphPatch *)(cross ? (const void *)ps_title_patches_cross : (const void *)ps_title_patches);
+        count = 1;
     }
-    _Static_assert(sizeof ps_glyph_patches[0] == sizeof(GlyphPatch) && sizeof ps_title_patches[0] == sizeof(GlyphPatch),
-                   "patch tables share one layout");
-    const GlyphPatch *patches = table;
     uint8_t *patched = malloc(bytes);
     if (!patched)
         return NULL;
@@ -439,7 +478,7 @@ static VkResult upload_compressed_mip(void *opaque, VkExtent2D extent, uint32_t 
                                       uint32_t first_layer, uint32_t layers, const uint8_t *linear, size_t bytes)
 {
     const DeferredTextureUpload *deferred = opaque;
-    uint8_t *patched = ps_glyph_patch(deferred->texture->format, extent, mip, layers, linear, bytes);
+    uint8_t *patched = ps_glyph_patch(deferred->texture, deferred->texture->format, extent, mip, layers, linear, bytes);
     if (patched)
         linear = patched;
     const bool volume = deferred->texture->sample_view_type == VK_IMAGE_VIEW_TYPE_3D;
@@ -700,6 +739,16 @@ static Shadow *shadow_find(const PokopiaVkTexture *texture)
     return NULL;
 }
 
+static void shadow_forget(void *texture);
+/* R92: both kinds of remembered texture (readback shadows, glyph textures). */
+static void texture_forget(void *texture)
+{
+    shadow_forget(texture);
+    for (unsigned i = 0; i < 4; ++i)
+        if (glyph_textures[i].texture == texture)
+            glyph_textures[i].texture = NULL;
+}
+
 static void shadow_forget(void *texture)
 {
     for (unsigned i = 0; i < SHADOWS; ++i)
@@ -836,7 +885,7 @@ static void shadow_add(PokopiaVkAdapter *adapter, PokopiaVkTexture *texture, con
     slot->serial = slot->batch = 0;
     shadow_adapter = adapter;
     pokopia_vk_before_batch_end_hook = shadow_record;
-    pokopia_vk_texture_forget_hook = shadow_forget;
+    pokopia_vk_texture_forget_hook = texture_forget;
 }
 
 /* A read from a current shadow; false when the slow path must run. */
@@ -1197,6 +1246,21 @@ VkResult pokopia_live_texture_prepare_sample(PokopiaLiveTextureUpload *upload, c
     if (!info || !info->native)
         return prepare_sample_slow(upload, info);
     const PokopiaVkTexture *texture = info->native;
+    /* R92: after a prompts/confirm change, a glyph texture is uploaded again
+     * from the game's bytes with the matching patch when next sampled. */
+    const unsigned generation = atomic_load_explicit(&pokopia_glyph_generation, memory_order_relaxed);
+    if (generation != glyph_seen_generation) {
+        glyph_seen_generation = generation;
+        for (unsigned i = 0; i < 4; ++i)
+            glyph_textures[i].stale = glyph_textures[i].texture != NULL;
+    }
+    for (unsigned i = 0; i < 4; ++i)
+        if (glyph_textures[i].texture == texture && glyph_textures[i].stale) {
+            glyph_textures[i].stale = false;
+            inline_allowed = true;
+            (void)prepare_deferred(upload, (PokopiaVkTexture *)texture, &info->create_info);
+            inline_allowed = false;
+        }
     const size_t at = (size_t)(((uintptr_t)texture >> 4) * UINT64_C(0x9e3779b97f4a7c15) >> 54) & (PREPARED_SLOTS - 1);
     if (prepared[at].texture == texture && prepared[at].epoch == pokopia_replay_job_epoch) {
         ++pokopia_prepare_skips;

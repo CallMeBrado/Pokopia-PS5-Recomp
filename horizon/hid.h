@@ -67,6 +67,8 @@ void hzn_hid_publish(void *memory, const HznHidState *hid, const HznHidPad *pad)
 #ifndef _WIN32
 /* Open one standard pad for the active PS4 user. Negative means unavailable. */
 int hzn_hid_ps4_open(void);
+/* R92: Cross acts as A and Circle as B (Western confirm), instead of by position. */
+extern bool hzn_hid_ps4_swap_ab;
 bool hzn_hid_ps4_read(int handle, HznHidPad *pad);
 bool hzn_hid_ps4_vibrate(int handle, float amplitude_low, float amplitude_high);
 void hzn_hid_ps4_close(int handle);

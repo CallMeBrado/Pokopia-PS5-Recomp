@@ -27,6 +27,19 @@ glyphs. Known issue: clouds render black. Performance notes and plans are in
 [docs/PS5_60FPS_PLAN.md](docs/PS5_60FPS_PLAN.md); the original port plan is in
 [docs/PS5_PORT_PLAN.md](docs/PS5_PORT_PLAN.md).
 
+## Port settings
+
+Hold the touch pad for about a second, anywhere in the game, to open the port's own settings
+(tapping it still opens the game's Settings as usual):
+
+- FPS counter and debug info overlays
+- Button prompts: PlayStation or the original Nintendo glyphs
+- Confirm button: Circle (Japanese / Nintendo layout) or Cross (Western)
+- Frame rate cap: 60 or 30
+- Upscaler: FSR 1 or bilinear, and FSR sharpness
+
+They are saved to `/data/pokopia/port-settings.ini` on the console.
+
 ## Building (outline)
 
 The build runs in a WSL Ubuntu environment with the PS5 payload SDK and the PS5_Vulkan RADV

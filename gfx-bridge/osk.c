@@ -427,11 +427,13 @@ void pokopia_osk_draw(const PokopiaOsk *osk, uint8_t *pixels, unsigned width, un
 
     /* Button legend along the bottom. */
     const int legend_y = (int)bottom - (int)(95 * s), icon_r = (int)(30 * s);
+    /* R92: the button acting as A (Circle, or Cross when swapped) selects. */
+    const bool cross = pokopia_settings.confirm == POKOPIA_CONFIRM_CROSS;
     const struct {
         char symbol;
         const char *label;
-    } legend[] = {{'o', "Select"}, {'x', "Delete"}, {'t', "Shift"}, {'s', "Space"}, {0, "OPTIONS  OK"},
-                  {0, "Touch pad  Cancel"}};
+    } legend[] = {{cross ? 'x' : 'o', "Select"}, {cross ? 'o' : 'x', "Delete"}, {'t', "Shift"}, {'s', "Space"},
+                  {0, "OPTIONS  OK"}, {0, "Touch pad  Cancel"}};
     int x = m.margin;
     for (unsigned i = 0; i < sizeof legend / sizeof legend[0]; ++i) {
         if (legend[i].symbol) {
@@ -441,4 +443,190 @@ void pokopia_osk_draw(const PokopiaOsk *osk, uint8_t *pixels, unsigned width, un
         draw_text(&kb, x, legend_y + (int)(20 * s), legend[i].label, 0.6f * s, ink);
         x += text_width(legend[i].label, 0.6f * s) + (int)(80 * s);
     }
+}
+
+/* ------------------------------------------------------------ R92: port menu */
+
+void pokopia_menu_init(PokopiaMenu *menu, const PokopiaSettings *settings)
+{
+    *menu = (PokopiaMenu){.values = *settings};
+}
+
+/* Moves a value by step (-1/+1); toggles flip either way. */
+static void menu_change(PokopiaMenu *menu, int step)
+{
+    PokopiaSettings *v = &menu->values;
+    switch (menu->row) {
+    case POKOPIA_MENU_FPS:
+        v->fps_counter = !v->fps_counter;
+        break;
+    case POKOPIA_MENU_DEBUG:
+        v->debug_info = !v->debug_info;
+        break;
+    case POKOPIA_MENU_PROMPTS:
+        v->prompts = v->prompts == POKOPIA_PROMPTS_PLAYSTATION ? POKOPIA_PROMPTS_NINTENDO : POKOPIA_PROMPTS_PLAYSTATION;
+        break;
+    case POKOPIA_MENU_CONFIRM:
+        v->confirm = v->confirm == POKOPIA_CONFIRM_CIRCLE ? POKOPIA_CONFIRM_CROSS : POKOPIA_CONFIRM_CIRCLE;
+        break;
+    case POKOPIA_MENU_CAP:
+        v->frame_cap = v->frame_cap == 60 ? 30 : 60;
+        break;
+    case POKOPIA_MENU_UPSCALER:
+        v->upscaler = v->upscaler == POKOPIA_UPSCALER_FSR ? POKOPIA_UPSCALER_BILINEAR : POKOPIA_UPSCALER_FSR;
+        break;
+    case POKOPIA_MENU_SHARPNESS: {
+        int level = (int)v->sharpness + step;
+        if (level < 0)
+            level = step < 0 ? 0 : POKOPIA_SHARPNESS_LEVELS - 1;
+        if (level >= POKOPIA_SHARPNESS_LEVELS)
+            level = 0; /* A cycles round; Right stops at the top below */
+        v->sharpness = (unsigned)level;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+PokopiaMenuState pokopia_menu_input(PokopiaMenu *menu, uint64_t buttons, uint64_t previous, int lx, int ly,
+                                    uint64_t now_ms, bool *changed)
+{
+    const uint64_t pressed = buttons & ~previous;
+    *changed = false;
+    if (pressed & (POKOPIA_OSK_B | POKOPIA_OSK_PLUS | POKOPIA_OSK_MINUS))
+        return POKOPIA_MENU_CLOSED;
+    int dx = 0, dy = 0;
+    if ((buttons & POKOPIA_OSK_LEFT) || lx < -16000)
+        dx = -1;
+    else if ((buttons & POKOPIA_OSK_RIGHT) || lx > 16000)
+        dx = 1;
+    if ((buttons & POKOPIA_OSK_UP) || ly > 16000)
+        dy = -1;
+    else if ((buttons & POKOPIA_OSK_DOWN) || ly < -16000)
+        dy = 1;
+    if (dx || dy) {
+        const bool fresh = dx != menu->held_dx || dy != menu->held_dy;
+        if (fresh || now_ms >= menu->next_repeat_ms) {
+            if (dy)
+                menu->row = (menu->row + POKOPIA_MENU_ROWS + (unsigned)(dy + POKOPIA_MENU_ROWS)) % POKOPIA_MENU_ROWS;
+            else if (menu->row != POKOPIA_MENU_CLOSE &&
+                     !(menu->row == POKOPIA_MENU_SHARPNESS &&
+                       ((dx > 0 && menu->values.sharpness + 1 >= POKOPIA_SHARPNESS_LEVELS) ||
+                        (dx < 0 && menu->values.sharpness == 0))))
+                menu_change(menu, dx);
+            menu->next_repeat_ms = now_ms + (fresh ? 380 : (dy ? 120 : 250));
+            *changed = true;
+        }
+    }
+    menu->held_dx = dx;
+    menu->held_dy = dy;
+    if (pressed & POKOPIA_OSK_A) {
+        if (menu->row == POKOPIA_MENU_CLOSE)
+            return POKOPIA_MENU_CLOSED;
+        menu_change(menu, 1);
+        *changed = true;
+    }
+    return POKOPIA_MENU_OPEN;
+}
+
+static const char *menu_value(const PokopiaSettings *v, unsigned row, char *buffer, size_t size)
+{
+    switch (row) {
+    case POKOPIA_MENU_FPS:
+        return v->fps_counter ? "On" : "Off";
+    case POKOPIA_MENU_DEBUG:
+        return v->debug_info ? "On" : "Off";
+    case POKOPIA_MENU_PROMPTS:
+        return v->prompts == POKOPIA_PROMPTS_PLAYSTATION ? "PlayStation" : "Nintendo";
+    case POKOPIA_MENU_CONFIRM:
+        return v->confirm == POKOPIA_CONFIRM_CIRCLE ? "Circle" : "Cross";
+    case POKOPIA_MENU_CAP:
+        return v->frame_cap == 30 ? "30 fps" : "60 fps";
+    case POKOPIA_MENU_UPSCALER:
+        return v->upscaler == POKOPIA_UPSCALER_FSR ? "FSR 1" : "Bilinear";
+    case POKOPIA_MENU_SHARPNESS: {
+        static const char *const names[POKOPIA_SHARPNESS_LEVELS] = {"Soft", "Low", "Medium", "High", "Max"};
+        (void)buffer;
+        (void)size;
+        return names[v->sharpness < POKOPIA_SHARPNESS_LEVELS ? v->sharpness : 3];
+    }
+    default:
+        return "";
+    }
+}
+
+void pokopia_menu_draw(const PokopiaMenu *menu, uint8_t *pixels, unsigned width, unsigned height, bool bgra)
+{
+    /* Laid out for a 1600-pixel-wide panel and scaled. */
+    const float s = (float)width / 1600.0f;
+    const Color band = {38, 52, 128}, white = {255, 255, 255}, panel = {214, 217, 224}, row_bg = {247, 248, 250},
+                ink = {52, 54, 64}, select = {0, 168, 255}, muted = {150, 154, 164}, value_bg = {228, 231, 238},
+                close_bg = {48, 112, 232}, frame = {24, 32, 80};
+    const Canvas c = {pixels, width, height, bgra};
+    fill(&c, 0, 0, (int)width, (int)height, frame);
+    const int border = (int)(6 * s) + 1, head = (int)(150 * s);
+    fill(&c, border, border, (int)width - 2 * border, head, band);
+    draw_text(&c, (int)(60 * s), (int)(100 * s), "Port settings", 0.9f * s, white);
+    const char *const hint = "PS5 port only - the game's own settings are unchanged";
+    draw_text(&c, (int)width - (int)(60 * s) - text_width(hint, 0.45f * s), (int)(98 * s), hint, 0.45f * s,
+              (Color){190, 200, 240});
+    fill(&c, border, border + head, (int)width - 2 * border, (int)height - 2 * border - head, panel);
+
+    static const char *const labels[POKOPIA_MENU_ROWS] = {
+        "FPS counter", "Debug info", "Button prompts", "Confirm button", "Frame rate cap", "Upscaler",
+        "FSR sharpness", "Close",
+    };
+    const int row_h = (int)(104 * s), gap = (int)(14 * s), x = (int)(60 * s), w = (int)width - 2 * x;
+    int y = border + head + (int)(40 * s);
+    const int radius = (int)(16 * s);
+    for (unsigned row = 0; row < POKOPIA_MENU_ROWS; ++row) {
+        const bool selected = row == menu->row;
+        const bool closing = row == POKOPIA_MENU_CLOSE;
+        const bool inactive = row == POKOPIA_MENU_SHARPNESS && menu->values.upscaler != POKOPIA_UPSCALER_FSR;
+        if (closing)
+            y += (int)(16 * s);
+        if (selected)
+            round_rect(&c, x - (int)(8 * s), y - (int)(8 * s), w + (int)(16 * s), row_h + (int)(16 * s),
+                       radius + (int)(8 * s), select);
+        if (closing) {
+            const int cw = (int)(360 * s), cx = x + (w - cw) / 2;
+            round_rect(&c, cx, y, cw, row_h, radius, close_bg);
+            draw_text(&c, cx + (cw - text_width(labels[row], 0.7f * s)) / 2, y + row_h / 2 + (int)(22 * s), labels[row],
+                      0.7f * s, white);
+            if (selected) /* the highlight is the button itself */
+                ;
+            y += row_h + gap;
+            continue;
+        }
+        round_rect(&c, x, y, w, row_h, radius, row_bg);
+        draw_text(&c, x + (int)(36 * s), y + row_h / 2 + (int)(22 * s), labels[row], 0.7f * s, inactive ? muted : ink);
+        char buffer[32];
+        const char *value = menu_value(&menu->values, row, buffer, sizeof buffer);
+        const int vw = (int)(420 * s), vx = x + w - vw - (int)(24 * s), vy = y + (int)(14 * s), vh = row_h - (int)(28 * s);
+        round_rect(&c, vx, vy, vw, vh, (int)(12 * s), value_bg);
+        const Color value_ink = inactive ? muted : ink;
+        draw_text(&c, vx + (vw - text_width(value, 0.65f * s)) / 2, vy + vh / 2 + (int)(20 * s), value, 0.65f * s,
+                  value_ink);
+        if (selected) {
+            draw_text(&c, vx + (int)(18 * s), vy + vh / 2 + (int)(20 * s), "<", 0.65f * s, value_ink);
+            draw_text(&c, vx + vw - (int)(18 * s) - text_width(">", 0.65f * s), vy + vh / 2 + (int)(20 * s), ">",
+                      0.65f * s, value_ink);
+        }
+        y += row_h + gap;
+    }
+
+    /* Legend: the button acting as A changes, the one acting as B closes. */
+    const bool cross = menu->values.confirm == POKOPIA_CONFIRM_CROSS;
+    const int legend_y = (int)height - border - (int)(60 * s), icon_r = (int)(26 * s);
+    int lx = x;
+    button_icon(&c, lx + icon_r, legend_y, icon_r, cross ? 'x' : 'o');
+    lx += 2 * icon_r + (int)(14 * s);
+    draw_text(&c, lx, legend_y + (int)(18 * s), "Change", 0.55f * s, ink);
+    lx += text_width("Change", 0.55f * s) + (int)(60 * s);
+    button_icon(&c, lx + icon_r, legend_y, icon_r, cross ? 'o' : 'x');
+    lx += 2 * icon_r + (int)(14 * s);
+    draw_text(&c, lx, legend_y + (int)(18 * s), "Close", 0.55f * s, ink);
+    lx += text_width("Close", 0.55f * s) + (int)(60 * s);
+    draw_text(&c, lx, legend_y + (int)(18 * s), "Left/Right  Change    Up/Down  Select", 0.55f * s, ink);
 }

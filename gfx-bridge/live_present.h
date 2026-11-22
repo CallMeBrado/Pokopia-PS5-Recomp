@@ -61,6 +61,14 @@ typedef struct {
     void *keyboard_pixels;
     bool keyboard_coherent, keyboard_visible;
     uint32_t keyboard_width, keyboard_top, keyboard_bottom;
+    /* R92: the port settings menu, one panel centred on the screen while
+     * visible; and switches that hide the FPS counter and the debug panel. */
+    VkBuffer menu_buffer;
+    VkDeviceMemory menu_memory;
+    void *menu_pixels;
+    bool menu_coherent, menu_visible;
+    uint32_t menu_width, menu_height;
+    bool fps_hidden, overlay_hidden;
 } PokopiaLivePresent;
 
 /* Start with a zeroed object. Borrow an open native swapchain and a dedicated
@@ -85,6 +93,12 @@ VkResult pokopia_live_present_fps_update(PokopiaLivePresent *live, const char *t
 VkResult pokopia_live_present_keyboard_pixels(PokopiaLivePresent *live, uint32_t top, uint32_t bottom,
     uint8_t **pixels, uint32_t *width, bool *bgra);
 VkResult pokopia_live_present_keyboard_flush(PokopiaLivePresent *live);
+
+/* R92: the menu panel's pixels (width x height, 4 bytes each; B,G,R,A when
+ * *bgra), made on first use. Flush after drawing; set menu_visible to show it. */
+VkResult pokopia_live_present_menu_pixels(PokopiaLivePresent *live, uint32_t width, uint32_t height,
+    uint8_t **pixels, bool *bgra);
+VkResult pokopia_live_present_menu_flush(PokopiaLivePresent *live);
 
 /* The caller supplies a completed render serial belonging to this image, an
  * exclusive single-sample 2D color image with TRANSFER_SRC usage. The stages

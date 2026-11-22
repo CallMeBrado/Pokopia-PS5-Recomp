@@ -42,4 +42,31 @@ PokopiaOskState pokopia_osk_input(PokopiaOsk *osk, uint64_t buttons, uint64_t pr
 void pokopia_osk_draw(const PokopiaOsk *osk, uint8_t *pixels, unsigned width, unsigned top, unsigned bottom,
                       bool bgra, uint64_t now_ms);
 
+/* R92: the port settings menu (opened by holding the touch pad), drawn in the
+ * keyboard's style. It edits a copy of the settings; the caller applies them. */
+#include "port_settings.h"
+
+enum {
+    POKOPIA_MENU_FPS, POKOPIA_MENU_DEBUG, POKOPIA_MENU_PROMPTS, POKOPIA_MENU_CONFIRM, POKOPIA_MENU_CAP,
+    POKOPIA_MENU_UPSCALER, POKOPIA_MENU_SHARPNESS, POKOPIA_MENU_CLOSE, POKOPIA_MENU_ROWS
+};
+
+typedef struct {
+    PokopiaSettings values;
+    unsigned row;
+    int held_dx, held_dy;
+    uint64_t next_repeat_ms;
+} PokopiaMenu;
+
+typedef enum { POKOPIA_MENU_OPEN, POKOPIA_MENU_CLOSED } PokopiaMenuState;
+
+void pokopia_menu_init(PokopiaMenu *menu, const PokopiaSettings *settings);
+/* Same pad conventions as pokopia_osk_input. A changes the selected value, B,
+ * OPTIONS or the touch pad close; *changed is set when values or the
+ * selection moved. */
+PokopiaMenuState pokopia_menu_input(PokopiaMenu *menu, uint64_t buttons, uint64_t previous, int lx, int ly,
+                                    uint64_t now_ms, bool *changed);
+/* Draws the whole panel (width x height, 4-byte pixels, B,G,R,A when bgra). */
+void pokopia_menu_draw(const PokopiaMenu *menu, uint8_t *pixels, unsigned width, unsigned height, bool bgra);
+
 #endif
