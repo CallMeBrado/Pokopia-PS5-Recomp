@@ -13,7 +13,8 @@ own copy of the game (version 2.0.1a), which you dump and recompile yourself.
 - **Recompiled game code** runs natively on the PS5's CPU (the recompiler output is generated
   locally from your dump and never committed).
 - **Horizon OS emulation** (`horizon/`): the Switch services the game uses (filesystem and saves,
-  HID mapped to the DualSense with rumble, audio, applets including a software keyboard).
+  HID mapped to the DualSense with rumble and a light bar that takes the colour of the Pokemon you
+  talk to, audio, applets including a software keyboard).
 - **NVN → Vulkan bridge** (`gfx-bridge/`): the game's NVN command buffers are replayed into Vulkan
   on the PS5's RADV driver ([PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)), with FSR 1
   upscaling and PlayStation button prompts.

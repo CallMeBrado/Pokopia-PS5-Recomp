@@ -73,6 +73,8 @@ bool hzn_hid_ps4_read(int handle, HznHidPad *pad);
 bool hzn_hid_ps4_vibrate(int handle, float amplitude_low, float amplitude_high);
 /* R96: re-sends the current non-zero vibration (call every ~16 ms). */
 void hzn_hid_ps4_refresh(void);
+/* R96: light bar colour for a Pokemon name label (see lightbar_colours.h). */
+void hzn_hid_ps4_lightbar_label(int handle, const char *label);
 void hzn_hid_ps4_close(int handle);
 #endif
 

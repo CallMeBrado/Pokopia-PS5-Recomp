@@ -84,6 +84,7 @@ int32_t scePadSetPS4BcVibrationMode(int32_t handle, int32_t mode);
 int32_t scePadEnablePs4CompatibleMode(int32_t handle);
 typedef struct OrbisPadColor { uint8_t r, g, b, a; } OrbisPadColor;
 int32_t scePadSetLightBar(int32_t handle, const OrbisPadColor *color);
+int32_t scePadResetLightBar(int32_t handle);
 int32_t scePadSetVibrationStrength(int32_t handle, int32_t strength);
 
 #ifdef __cplusplus

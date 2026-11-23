@@ -6,6 +6,10 @@
 
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "lightbar_colours.h"
 
 int hzn_hid_ps4_open(void)
 {
@@ -165,4 +169,40 @@ void hzn_hid_ps4_close(int handle)
         vibration_handle = -1;
         (void)scePadClose(handle);
     }
+}
+
+/* R96: the light bar follows the Pokemon you talk to. The game writes the
+ * speaker's name into its text slots as a conversation opens, then the
+ * dialogue text replaces it within ~10 ms, so the colour is sticky: it stays
+ * until a free-roaming prompt ("Talk" or "Run", shown again once the
+ * conversation ends) or 60 s pass. */
+static int lightbar_compare(const void *key, const void *entry)
+{
+    return strcmp(key, ((const HznLightbarColour *)entry)->name);
+}
+
+void hzn_hid_ps4_lightbar_label(int handle, const char *label)
+{
+    static uint32_t current = UINT32_MAX;
+    static struct timespec since;
+    if (handle < 0 || !label)
+        return;
+    const HznLightbarColour *found = bsearch(label, hzn_lightbar_colours,
+        sizeof hzn_lightbar_colours / sizeof hzn_lightbar_colours[0], sizeof hzn_lightbar_colours[0], lightbar_compare);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (found) {
+        since = now;
+        if (found->rgb != current) {
+            const OrbisPadColor color = {(uint8_t)(found->rgb >> 16), (uint8_t)(found->rgb >> 8), (uint8_t)found->rgb, 255};
+            if (scePadSetLightBar(handle, &color) == 0)
+                current = found->rgb;
+        }
+        return;
+    }
+    if (current == UINT32_MAX)
+        return;
+    const bool roaming = !strcmp(label, "Talk") || !strcmp(label, "Run");
+    if ((roaming || now.tv_sec - since.tv_sec >= 60) && scePadResetLightBar(handle) == 0)
+        current = UINT32_MAX;
 }

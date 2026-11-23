@@ -721,6 +721,10 @@ static void prof_report_fast(FILE *log);
 #endif
 
 static void fatal_signal(int signal, siginfo_t *info, void *context);
+/* R96: the memory scanner reads guest ranges that may not be backed; a
+ * fault on its thread jumps back into it instead of ending the process. */
+static _Thread_local volatile int memscan_guarded;
+static _Thread_local jmp_buf memscan_jump; /* setjmp: sigsetjmp is not in the PS5 libc */
 static _Atomic(StatThread *) prof_host_target;
 static atomic_bool prof_raw_pc_only;
 
@@ -1282,6 +1286,8 @@ static void wait_work_tick(unsigned count)
 }
 #endif
 
+static void memscan_poll(void);
+static bool memscan_copy(void *destination, uint64_t address, size_t size);
 static void *prof_main(void *unused)
 {
     (void)unused;
@@ -1291,8 +1297,36 @@ static void *prof_main(void *unused)
         ++ticks;
         if (ticks % 16 == 0)
             hzn_hid_ps4_refresh(); /* R96: keep rumble alive (the PS5 drops unrepeated values) */
+        if (native_pad >= 0) { /* every 1 ms tick: a name stays in the slot only ~10 ms */
+            /* R96: the game's text slots at 0x71036bdff0 (formatted on-screen
+             * text) and 0x71036bbff0 (message templates); the light bar takes
+             * the colour of a Pokemon name in either. Diagnostics log every
+             * change (first 100). */
+            static const uint64_t slots[2] = {UINT64_C(0x71036bdff0), UINT64_C(0x71036bbff0)};
+            static char last[2][48];
+            static unsigned changes;
+            for (int k = 0; k < 2; ++k) {
+                char label[48];
+                if (!memscan_copy(label, slots[k], sizeof label - 1))
+                    continue;
+                label[sizeof label - 1] = 0;
+                if (!strcmp(label, last[k]))
+                    continue;
+                memcpy(last[k], label, sizeof label);
+                hzn_hid_ps4_lightbar_label(native_pad, label);
+                if (changes < 100) {
+                    ++changes;
+                    for (size_t i = 0; i < sizeof label && label[i]; ++i)
+                        if (label[i] == 10 || label[i] == 13)
+                            label[i] = 32;
+                    fprintf(probe_log, "Label slot%d t=%.2fs [%s]%c", k, pokopia_boot_monotonic_ns() * 1e-9, label, 10);
+                    fflush(probe_log);
+                }
+            }
+        }
         if (ticks % 1000 == 0) {
             timeline_tick();
+            memscan_poll(); /* R96 */
             /* R96: rumble experiment. debug/rumble holds "kind mode" (see
              * hzn_hid_ps4_rumble_mode); switch the pad's vibration mode, then
              * pulse both motors at full strength for a second. */
@@ -2186,6 +2220,146 @@ static const void *read_guest(void *opaque, uint64_t address, size_t size)
         return NULL;
     guest_cache_fill_range(address, size);
     return (const void *)(uintptr_t)address;
+}
+
+/* R96: debug memory tools, polled once a second by the profiler thread.
+ *   debug/memfind  "u16 TEXT" | "u8 TEXT" | "hex AABBCC..."  -> debug/memfind.txt
+ *                  (every readable guest region; up to 400 hits with context)
+ *   debug/memread  "ADDRESS LENGTH" (hex; length <= 16 MiB) -> debug/memread.bin
+ * Requests end with a newline. Unbacked pages are skipped through the fault
+ * guard in fatal_signal. */
+static bool memscan_copy(void *destination, uint64_t address, size_t size)
+{
+    if (setjmp(memscan_jump))
+        return false;
+    memscan_guarded = 1;
+    memcpy(destination, (const void *)(uintptr_t)address, size);
+    memscan_guarded = 0;
+    return true;
+}
+
+static size_t memscan_pattern(const char *line, uint8_t *pattern, size_t capacity)
+{
+    char kind[8] = {0};
+    int skip = 0;
+    if (sscanf(line, "%7s %n", kind, &skip) != 1)
+        return 0;
+    const char *text = line + skip;
+    const size_t length = strcspn(text, "\r\n");
+    size_t n = 0;
+    if (!strcmp(kind, "u16")) {
+        for (size_t i = 0; i < length && n + 2 <= capacity; ++i) {
+            pattern[n++] = (uint8_t)text[i];
+            pattern[n++] = 0;
+        }
+    } else if (!strcmp(kind, "u8")) {
+        for (size_t i = 0; i < length && n < capacity; ++i)
+            pattern[n++] = (uint8_t)text[i];
+    } else if (!strcmp(kind, "hex")) {
+        for (size_t i = 0; i + 1 < length && n < capacity; i += 2) {
+            unsigned byte;
+            if (sscanf(text + i, "%2x", &byte) != 1)
+                break;
+            pattern[n++] = (uint8_t)byte;
+        }
+    }
+    return n;
+}
+
+static void memscan_find(const char *line)
+{
+    uint8_t pattern[128];
+    const size_t length = memscan_pattern(line, pattern, sizeof pattern);
+    FILE *out = fopen("/data/pokopia/debug/memfind.txt.tmp", "w");
+    if (!out)
+        return;
+    fprintf(out, "memfind %s", line);
+    enum { CHUNK = 65536, MAX_HITS = 400 };
+    static uint8_t buffer[CHUNK + 128];
+    unsigned hits = 0, regions = 0;
+    uint64_t scanned = 0, faulted = 0;
+    const uint64_t start_ns = stat_now_ns();
+    for (uint64_t address = 0; length && hits < MAX_HITS;) {
+        kernel_lock();
+        const MemoryInfo region = query_memory(address);
+        kernel_unlock();
+        if (!region.size || region.base + region.size <= address)
+            break;
+        const uint64_t end = region.base + region.size;
+        if ((region.permission & 1) && region.type != 0 && region.type != 0x10) {
+            ++regions;
+            for (uint64_t at = region.base; at < end && hits < MAX_HITS; at += CHUNK) {
+                size_t size = end - at < CHUNK + length - 1 ? (size_t)(end - at) : CHUNK + length - 1;
+                if (!memscan_copy(buffer, at, size)) {
+                    /* the overlap may run into an unbacked chunk */
+                    size = end - at < CHUNK ? (size_t)(end - at) : CHUNK;
+                    if (!memscan_copy(buffer, at, size)) {
+                        faulted += size;
+                        continue;
+                    }
+                }
+                scanned += size;
+                for (size_t i = 0; i + length <= size && hits < MAX_HITS; ++i) {
+                    if (buffer[i] != pattern[0] || memcmp(buffer + i, pattern, length))
+                        continue;
+                    const uint64_t hit = at + i;
+                    uint8_t context[160];
+                    const uint64_t from = hit >= 32 ? hit - 32 : 0;
+                    const bool ok = memscan_copy(context, from, sizeof context);
+                    fprintf(out, "hit %#" PRIx64 " region=%#" PRIx64 "+%#" PRIx64 " type=%#x perm=%u ctx@%#" PRIx64 " ",
+                            hit, region.base, region.size, region.type, region.permission, from);
+                    for (size_t k = 0; k < sizeof context; ++k)
+                        fprintf(out, ok ? "%02x" : "??", context[k]);
+                    fputc('\n', out);
+                    ++hits;
+                }
+            }
+        }
+        address = end;
+    }
+    fprintf(out, "done hits=%u regions=%u scanned_mib=%.1f faulted_mib=%.1f ms=%.0f\n", hits, regions,
+            scanned / 1048576.0, faulted / 1048576.0, (stat_now_ns() - start_ns) * 1e-6);
+    fclose(out);
+    rename("/data/pokopia/debug/memfind.txt.tmp", "/data/pokopia/debug/memfind.txt");
+}
+
+static void memscan_read(const char *line)
+{
+    unsigned long long address = 0, length = 0;
+    if (sscanf(line, "%llx %llx", &address, &length) != 2 || !length || length > (16u << 20))
+        return;
+    FILE *out = fopen("/data/pokopia/debug/memread.bin.tmp", "wb");
+    if (!out)
+        return;
+    static uint8_t chunk[4096];
+    for (uint64_t at = address; at < address + length; at += sizeof chunk) {
+        const size_t size = address + length - at < sizeof chunk ? (size_t)(address + length - at) : sizeof chunk;
+        if (!memscan_copy(chunk, at, size))
+            memset(chunk, 0xee, size);
+        fwrite(chunk, 1, size, out);
+    }
+    fclose(out);
+    rename("/data/pokopia/debug/memread.bin.tmp", "/data/pokopia/debug/memread.bin");
+}
+
+static void memscan_poll(void)
+{
+    static const char *const requests[2] = {"/data/pokopia/debug/memfind", "/data/pokopia/debug/memread"};
+    for (int r = 0; r < 2; ++r) {
+        FILE *file = fopen(requests[r], "r");
+        if (!file)
+            continue;
+        char line[512] = {0};
+        const bool got = fgets(line, sizeof line, file) != NULL;
+        fclose(file);
+        if (!got || !strchr(line, '\n'))
+            continue; /* still being written */
+        unlink(requests[r]);
+        if (r == 0)
+            memscan_find(line);
+        else
+            memscan_read(line);
+    }
 }
 
 static void log_guest_frames(const Ctx *context)
@@ -6704,6 +6878,10 @@ static int enter_rtld(void)
  * cannot recover, so its page-in path is unchanged. */
 static void fatal_signal(int signal, siginfo_t *info, void *context)
 {
+    if (memscan_guarded && (signal == SIGSEGV || signal == SIGBUS)) {
+        memscan_guarded = 0;
+        longjmp(memscan_jump, 1); /* SA_NODEFER: SIGSEGV stays unblocked */
+    }
     (void)context;
     char line[160];
     const bool close_request = signal == SIGTERM || signal == SIGINT || signal == SIGHUP;
@@ -6763,7 +6941,7 @@ static void install_fatal_handlers(void)
     /* OpenOrbis' sa_sigaction macro names a member its union lacks. */
     action.__sa_handler.__sa_sigaction = (void (*)(int, struct __siginfo *, void *))fatal_signal;
 #endif
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER; /* R96: lets the memory scanner longjmp out */
     sigemptyset(&action.sa_mask);
     static const int signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTERM, SIGINT, SIGHUP };
     for (size_t i = 0; i < sizeof signals / sizeof signals[0]; ++i)
