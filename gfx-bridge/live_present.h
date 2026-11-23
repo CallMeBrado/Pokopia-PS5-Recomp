@@ -69,6 +69,19 @@ typedef struct {
     bool menu_coherent, menu_visible;
     uint32_t menu_width, menu_height;
     bool fps_hidden, overlay_hidden;
+    /* R96: the title screen's "PlayStation Edition" banner (ps_banner.h),
+     * blended into the FSR output at (banner_x, banner_y) while banner_alpha
+     * is above zero. Built on first use. */
+    bool banner_tried, banner_ready;
+    VkBuffer banner_buffer;
+    VkDeviceMemory banner_memory;
+    VkDescriptorSetLayout banner_set_layout;
+    VkPipelineLayout banner_layout;
+    VkPipeline banner_pipeline;
+    VkDescriptorPool banner_pool;
+    VkDescriptorSet banner_set;
+    float banner_alpha;
+    int32_t banner_x, banner_y;
 } PokopiaLivePresent;
 
 /* Start with a zeroed object. Borrow an open native swapchain and a dedicated

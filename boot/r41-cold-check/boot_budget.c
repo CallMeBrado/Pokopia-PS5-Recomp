@@ -332,6 +332,24 @@ static uint64_t system_tick(void)
            (host_counter % host_tick_hz) * guest_tick_hz / host_tick_hz;
 }
 
+/* R96 (debug): the guest's view of the system tick can run faster or slower
+ * (debug/tickscale, percent) to tell time-paced code from work-paced code.
+ * Re-anchored on every change so the guest clock never jumps. */
+volatile unsigned pokopia_tick_scale_pct = 100;
+static uint64_t guest_system_tick(void)
+{
+    static unsigned scale = 100;
+    static uint64_t anchor_raw, anchor_guest;
+    const uint64_t raw = system_tick();
+    const unsigned wanted = pokopia_tick_scale_pct;
+    if (wanted != scale) {
+        anchor_guest = scale == 100 && !anchor_raw ? raw : anchor_guest + (raw - anchor_raw) * scale / 100;
+        anchor_raw = raw;
+        scale = wanted;
+    }
+    return scale == 100 && !anchor_raw ? raw : anchor_guest + (raw - anchor_raw) * scale / 100;
+}
+
 uint64_t pokopia_boot_monotonic_ns(void)
 {
     return system_tick() * (1000000000 / guest_tick_hz);
@@ -380,7 +398,7 @@ bool pokopia_boot_svc(Ctx *cpu, uint32_t number, FILE *log)
         return true;
     }
     case 0x1e: /* GetSystemTick */
-        cpu->x[0] = system_tick();
+        cpu->x[0] = guest_system_tick();
         return true;
     case 0x29: { /* GetInfo */
         uint32_t type = (uint32_t)cpu->x[1];
@@ -497,15 +515,34 @@ uint64_t pokopia_boot_import(uint32_t id, const char **name)
     return 0;
 }
 
+/* R96 (debug): while pokopia_tick_callers_on is set, count counter-register
+ * reads by the reading function's return address (its caller), to find the
+ * game's frame limiter. Racy by design; slots are claimed once. */
+volatile int pokopia_tick_callers_on;
+struct PokopiaTickCaller { uint64_t lr, fn, count; } pokopia_tick_callers[64];
+
 uint64_t guest_mrs(Ctx *cpu, uint32_t reg)
 {
-    (void)cpu;
     switch (reg) {
     case 0xdf00:
         return guest_tick_hz;
     case 0xdf01:
     case 0xdf02:
-        return system_tick();
+        if (pokopia_tick_callers_on && cpu) {
+            for (unsigned i = 0; i < 64; ++i) {
+                if (pokopia_tick_callers[i].lr == cpu->x[30]) {
+                    ++pokopia_tick_callers[i].count;
+                    break;
+                }
+                if (!pokopia_tick_callers[i].lr) {
+                    pokopia_tick_callers[i].fn = cpu->fn;
+                    pokopia_tick_callers[i].count = 1;
+                    pokopia_tick_callers[i].lr = cpu->x[30];
+                    break;
+                }
+            }
+        }
+        return guest_system_tick();
     default:
         guest_trap("unsupported system register read", reg);
         return 0;

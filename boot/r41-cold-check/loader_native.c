@@ -202,6 +202,8 @@ static char account_save_root[HZN_SAVE_PATH_MAX];
 #else
 static const char account_save_root[] = "/data/pokopia/save-r40";
 static int native_pad = -1;
+/* R96: debug/framecap (30, 60 or 0), -1 when the port menu's setting applies. */
+static volatile int pokopia_frame_cap_override = -1;
 #endif
 #endif
 static HznTimeConfig clock_config;
@@ -254,6 +256,21 @@ static void port_settings_once(void)
     pokopia_settings_load(&loaded, PORT_SETTINGS_PATH);
     pokopia_settings = loaded;
     hzn_hid_ps4_swap_ab = loaded.confirm == POKOPIA_CONFIRM_CROSS;
+}
+
+/* R96: the game's frame limiter (0x710089df20) targets 60.0f / 1.0f frames a
+ * second; ps5/build/patch-lift.py makes it call this for the numerator every
+ * frame instead. Its delta time stays measured, so the game's speed is right
+ * at any rate. Uncapped is 1000 (a 1 ms period: no wait); the display's
+ * refresh (FIFO) is then the limit. debug/framecap overrides the menu. */
+uint32_t pokopia_frame_limit_bits(void)
+{
+    const int override = pokopia_frame_cap_override;
+    const unsigned cap = override >= 0 ? (unsigned)override : pokopia_settings.frame_cap;
+    const float fps = cap == 30 ? 30.0f : cap == 0 ? 1000.0f : 60.0f;
+    uint32_t bits;
+    memcpy(&bits, &fps, sizeof bits);
+    return bits;
 }
 
 static uint64_t stat_now_ns(void);
@@ -356,6 +373,50 @@ static void update_guest_pad(void)
                         nvn_replay_trace_submits = 30;
                     }
                     fprintf(probe_log, "Frame trace requested\n");
+                }
+                /* R96: debug/framecap overrides the port menu's frame cap (30, 60, 0). */
+                snprintf(trace_request, sizeof trace_request, "%s/framecap", live_capture.mailbox.directory);
+                FILE *cap_file = fopen(trace_request, "r");
+                if (cap_file) {
+                    int cap;
+                    if (fscanf(cap_file, "%d", &cap) == 1 && cap != pokopia_frame_cap_override) {
+                        pokopia_frame_cap_override = cap;
+                        fprintf(probe_log, "Frame cap override %d (display %u mHz)\n", cap, pokopia_present_refresh_mhz);
+                    }
+                    fclose(cap_file);
+                }
+                /* R96: debug/tickscale (percent) speeds up or slows the guest's system tick. */
+                snprintf(trace_request, sizeof trace_request, "%s/tickscale", live_capture.mailbox.directory);
+                FILE *tick_file = fopen(trace_request, "r");
+                if (tick_file) {
+                    extern volatile unsigned pokopia_tick_scale_pct;
+                    unsigned pct;
+                    if (fscanf(tick_file, "%u", &pct) == 1 && pct >= 10 && pct <= 400 && pct != pokopia_tick_scale_pct) {
+                        pokopia_tick_scale_pct = pct;
+                        fprintf(probe_log, "Guest tick scale %u%%\n", pct);
+                    }
+                    fclose(tick_file);
+                }
+                /* R96: debug/tickcallers: 1 counts system-tick reads by caller, 2 logs and stops. */
+                snprintf(trace_request, sizeof trace_request, "%s/tickcallers", live_capture.mailbox.directory);
+                FILE *callers_file = fopen(trace_request, "r");
+                if (callers_file) {
+                    extern volatile int pokopia_tick_callers_on;
+                    extern struct PokopiaTickCaller { uint64_t lr, fn, count; } pokopia_tick_callers[64];
+                    int mode = 0;
+                    const int fields = fscanf(callers_file, "%d", &mode);
+                    fclose(callers_file);
+                    unlink(trace_request);
+                    if (fields == 1 && mode == 1) {
+                        memset(pokopia_tick_callers, 0, sizeof pokopia_tick_callers);
+                        pokopia_tick_callers_on = 1;
+                    } else if (fields == 1 && mode == 2) {
+                        pokopia_tick_callers_on = 0;
+                        for (unsigned i = 0; i < 64 && pokopia_tick_callers[i].lr; ++i)
+                            fprintf(probe_log, "Tick caller lr=%#" PRIx64 " fn=%#" PRIx64 " reads=%" PRIu64 "\n",
+                                    pokopia_tick_callers[i].lr, pokopia_tick_callers[i].fn, pokopia_tick_callers[i].count);
+                        fflush(probe_log);
+                    }
                 }
                 /* R73: debug/exposure overrides the stand-in auto-exposure. */
                 extern float pokopia_exposure_fallback;
@@ -3924,12 +3985,19 @@ static NvnFrontReplyKind present_nvn_frame(const uint64_t x[32])
     if (pokopia_trace_guest_tid() == 1)
         hzn_thread_test_affinity(0, (pokopia_debug_flags & POKOPIA_DEBUG_AFFINITY) != 0);
 #endif
-    /* R92: the port menu's 30 fps cap. The game thread sleeps after this
-     * present until 33 ms after the last one (dispatch_graphics), so FIFO
-     * presentation shows each frame for two vblanks. */
-    if (pokopia_settings.frame_cap == 30) {
+    /* R92/R96: the port menu's frame cap. The game thread sleeps after this
+     * present until a frame period (a little under, so the present still
+     * lands on the vblank it is due for) after the last one, in
+     * dispatch_graphics; FIFO presentation then shows each frame for two
+     * (60 fps at 120 Hz, 30 at 60 Hz) or four vblanks. Uncapped (0), and a
+     * cap at or above the display's refresh, do not sleep: the game then
+     * runs up to the display's refresh. debug/framecap overrides the menu. */
+    const unsigned frame_cap = pokopia_frame_cap_override >= 0 ? (unsigned)pokopia_frame_cap_override
+                                                               : pokopia_settings.frame_cap;
+    const uint32_t refresh_mhz = pokopia_present_refresh_mhz ? pokopia_present_refresh_mhz : 59940;
+    if (frame_cap && frame_cap * 1000u < refresh_mhz - 1000u) {
         static uint64_t cap_due;
-        const uint64_t now = stat_now_ns(), frame = UINT64_C(33000000);
+        const uint64_t now = stat_now_ns(), frame = frame_cap == 30 ? UINT64_C(33000000) : UINT64_C(16400000);
         if (cap_due > now) {
             present_pace_until = cap_due;
             STAT_ADD(stat_paced_frames, 1);
@@ -4051,6 +4119,21 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
             live_output.menu_visible = false;
         }
     }
+#if defined(__PROSPERO__)
+    {
+        /* R96: "PlayStation Edition" under the logo while the title screen's logo
+         * texture is being drawn, fading in and out (FSR output path). */
+        extern volatile int pokopia_title_drawn;
+        const bool title = pokopia_title_drawn != 0;
+        pokopia_title_drawn = 0;
+        float alpha = live_output.banner_alpha + (title ? 0.1f : -0.2f);
+        live_output.banner_alpha = alpha < 0.0f ? 0.0f : alpha > 1.0f ? 1.0f : alpha;
+        if (live_output.present) {
+            live_output.banner_x = (int32_t)((uint64_t)live_output.present->extent.width * 2510 / 3840);
+            live_output.banner_y = (int32_t)((uint64_t)live_output.present->extent.height * 1285 / 2160);
+        }
+    }
+#endif
     VkResult result = pokopia_live_present_frame(&live_output, &frame, UINT64_C(5000000000), &shot);
     {
         /* R72: say why a requested screenshot was not saved. */

@@ -407,6 +407,7 @@ static struct {
 } glyph_textures[4];
 static unsigned glyph_seen_generation;
 static void texture_forget(void *texture);
+extern void *volatile pokopia_title_texture; /* R96, defined below */
 
 static void glyph_texture_seen(const PokopiaVkTexture *texture)
 {
@@ -435,6 +436,8 @@ static uint8_t *ps_glyph_patch(const PokopiaVkTexture *texture, VkFormat format,
     if (hash != PS_GLYPH_ATLAS_HASH && hash != PS_TITLE_TEXTURE_HASH)
         return NULL;
     glyph_texture_seen(texture);
+    if (hash == PS_TITLE_TEXTURE_HASH)
+        pokopia_title_texture = (void *)texture; /* R96: the title banner shows while it is drawn */
     /* R92: Nintendo prompts keep the game's own glyphs. */
     if (pokopia_settings.prompts == POKOPIA_PROMPTS_NINTENDO)
         return NULL;
@@ -740,10 +743,18 @@ static Shadow *shadow_find(const PokopiaVkTexture *texture)
 }
 
 static void shadow_forget(void *texture);
+/* R96: the game's title logo texture (recognised by its hash in ps_glyph_patch),
+ * and a flag any draw sampling it sets; present reads and clears it to show the
+ * "PlayStation Edition" banner while the title screen is up. */
+void *volatile pokopia_title_texture;
+volatile int pokopia_title_drawn;
+
 /* R92: both kinds of remembered texture (readback shadows, glyph textures). */
 static void texture_forget(void *texture)
 {
     shadow_forget(texture);
+    if (texture == pokopia_title_texture)
+        pokopia_title_texture = NULL;
     for (unsigned i = 0; i < 4; ++i)
         if (glyph_textures[i].texture == texture)
             glyph_textures[i].texture = NULL;

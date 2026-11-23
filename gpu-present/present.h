@@ -40,6 +40,8 @@ typedef struct {
 
 /* Enable VK_KHR_surface and VK_EXT_headless_surface on the instance, and
  * VK_KHR_swapchain on the device. On Orbis this surface names the TV. */
+/* R96: the display mode's refresh in millihertz (119880 at 120 Hz), 0 when unknown. */
+extern uint32_t pokopia_present_refresh_mhz;
 VkResult pokopia_present_surface(VkInstance instance, VkSurfaceKHR *surface);
 
 /* Start with a zeroed object. The caller retains the device and surface and

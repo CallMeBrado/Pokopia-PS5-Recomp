@@ -22,9 +22,11 @@ own copy of the game (version 2.0.1a), which you dump and recompile yourself.
 
 ## Status
 
-Boots to the title screen, loads and writes saves, and plays in the world. Around 55-60 fps
-indoors and 47-53 fps outdoors. Button prompts, including the title screen's, show PlayStation
-glyphs. Performance notes and plans are in
+Boots to the title screen, loads and writes saves, and plays in the world at 60 fps. On a 120 Hz
+display the console outputs 120 Hz; the port menu's frame cap offers 30, 60 or Uncapped (Uncapped
+runs above 60, but some of the game's systems assume 60 and then run faster). Button prompts,
+including the title screen's, show PlayStation glyphs, and the title screen reads "PlayStation
+Edition" under the logo. Performance notes and plans are in
 [docs/PS5_60FPS_PLAN.md](docs/PS5_60FPS_PLAN.md); the original port plan is in
 [docs/PS5_PORT_PLAN.md](docs/PS5_PORT_PLAN.md).
 

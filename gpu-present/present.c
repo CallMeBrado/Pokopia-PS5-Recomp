@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <time.h>
 
+uint32_t pokopia_present_refresh_mhz; /* R96: the display mode's refresh, 0 when unknown */
+
 #if defined(__PROSPERO__)
 /* PS5 RADV presents through VideoOut behind VK_KHR_display: the first display's
  * first mode, a full-screen opaque plane (probe-verified at 3840x2160). */
@@ -35,6 +37,9 @@ VkResult pokopia_present_surface(VkInstance instance, VkSurfaceKHR *surface)
     result = modes(physical, display.display, &count, &mode);
     if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !count)
         return result != VK_SUCCESS && result != VK_INCOMPLETE ? result : VK_ERROR_INITIALIZATION_FAILED;
+    /* R96: the driver lists 119.88 Hz first when the title declares high frame
+     * rate (param.json attribute3 0x80040) and the display runs at 120 Hz. */
+    pokopia_present_refresh_mhz = mode.parameters.refreshRate;
     const VkDisplaySurfaceCreateInfoKHR info = {
         .sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR,
         .displayMode = mode.displayMode,

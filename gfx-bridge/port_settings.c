@@ -39,7 +39,7 @@ void pokopia_settings_load(PokopiaSettings *settings, const char *path)
             settings->prompts = value;
         else if (!strcmp(key, "confirm") && value <= POKOPIA_CONFIRM_CROSS)
             settings->confirm = value;
-        else if (!strcmp(key, "frame_cap") && (value == 30 || value == 60))
+        else if (!strcmp(key, "frame_cap") && (value == 0 || value == 30 || value == 60))
             settings->frame_cap = value;
         else if (!strcmp(key, "upscaler") && value <= POKOPIA_UPSCALER_BILINEAR)
             settings->upscaler = value;
@@ -61,7 +61,7 @@ bool pokopia_settings_save(const PokopiaSettings *settings, const char *path)
             "fps_counter = %u\ndebug_info = %u\n"
             "# prompts: 0 PlayStation, 1 Nintendo; confirm: 0 Circle, 1 Cross\n"
             "prompts = %u\nconfirm = %u\n"
-            "# frame_cap: 60 or 30; upscaler: 0 FSR 1, 1 bilinear; sharpness: 0-4\n"
+            "# frame_cap: 60, 30 or 0 (uncapped); upscaler: 0 FSR 1, 1 bilinear; sharpness: 0-4\n"
             "frame_cap = %u\nupscaler = %u\nsharpness = %u\n",
             settings->fps_counter, settings->debug_info, settings->prompts, settings->confirm, settings->frame_cap,
             settings->upscaler, settings->sharpness);

@@ -1,0 +1,30 @@
+#version 450
+// R96: blend the title screen's "PlayStation Edition" banner into the final
+// (upscaled) image. Each banner pixel packs three coverages: white (x), black
+// (y) and shadow (z); they are blended in that order's reverse, scaled by the
+// fade alpha. The image is the sRGB-encoded result viewed as UNORM, so the
+// blend happens on encoded values, as the banner generator previews it.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba8) uniform image2D target;
+layout(set = 0, binding = 1, std430) readonly buffer Banner { uint px[]; };
+layout(push_constant) uniform Params {
+    ivec2 origin;
+    uvec2 size;
+    float alpha;
+} p;
+
+void main()
+{
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= p.size.x || at.y >= p.size.y)
+        return;
+    vec4 c = unpackUnorm4x8(px[at.y * p.size.x + at.x]) * p.alpha;
+    if (c.x + c.y + c.z == 0.0)
+        return;
+    ivec2 q = p.origin + ivec2(at);
+    vec3 d = imageLoad(target, q).rgb;
+    d = mix(d, vec3(13.0, 11.0, 9.0) / 255.0, c.z);
+    d = mix(d, vec3(0.0), c.y);
+    d = mix(d, vec3(1.0), c.x);
+    imageStore(target, q, vec4(d, 1.0));
+}

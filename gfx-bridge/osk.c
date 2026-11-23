@@ -470,7 +470,9 @@ static void menu_change(PokopiaMenu *menu, int step)
         v->confirm = v->confirm == POKOPIA_CONFIRM_CIRCLE ? POKOPIA_CONFIRM_CROSS : POKOPIA_CONFIRM_CIRCLE;
         break;
     case POKOPIA_MENU_CAP:
-        v->frame_cap = v->frame_cap == 60 ? 30 : 60;
+        /* R96: 60 -> Uncapped -> 30 -> 60 (Left goes the other way) */
+        v->frame_cap = step < 0 ? (v->frame_cap == 60 ? 30 : v->frame_cap == 30 ? 0 : 60)
+                                : (v->frame_cap == 60 ? 0 : v->frame_cap == 0 ? 30 : 60);
         break;
     case POKOPIA_MENU_UPSCALER:
         v->upscaler = v->upscaler == POKOPIA_UPSCALER_FSR ? POKOPIA_UPSCALER_BILINEAR : POKOPIA_UPSCALER_FSR;
@@ -542,7 +544,7 @@ static const char *menu_value(const PokopiaSettings *v, unsigned row, char *buff
     case POKOPIA_MENU_CONFIRM:
         return v->confirm == POKOPIA_CONFIRM_CIRCLE ? "Circle" : "Cross";
     case POKOPIA_MENU_CAP:
-        return v->frame_cap == 30 ? "30 fps" : "60 fps";
+        return v->frame_cap == 30 ? "30 fps" : v->frame_cap == 0 ? "Uncapped" : "60 fps";
     case POKOPIA_MENU_UPSCALER:
         return v->upscaler == POKOPIA_UPSCALER_FSR ? "FSR 1" : "Bilinear";
     case POKOPIA_MENU_SHARPNESS: {

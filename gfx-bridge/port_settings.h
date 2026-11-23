@@ -17,7 +17,7 @@ typedef struct {
     bool debug_info;    /* the developer box, top left */
     unsigned prompts;   /* button glyphs: PlayStation or the game's Nintendo ones */
     unsigned confirm;   /* the PlayStation button that acts as A: Circle (right) or Cross (bottom) */
-    unsigned frame_cap; /* 60 or 30 */
+    unsigned frame_cap; /* 60, 30, or 0: uncapped (up to the display's refresh, 120 Hz where it runs at 120) */
     unsigned upscaler;  /* FSR 1 or bilinear */
     unsigned sharpness; /* FSR sharpening, 0 (soft) to 4 (sharpest) */
 } PokopiaSettings;

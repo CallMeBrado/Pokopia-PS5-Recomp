@@ -19,7 +19,9 @@ declare -A lift=(
 modules=("$@")
 (( ${#modules[@]} )) || modules=(subsdk0 sdk main)
 jobs=${JOBS:-$(nproc)}
-flags=(-std=c++20 -march=znver2 -mcx16 -O1 -fPIC -fno-exceptions -fno-rtti -ffp-contract=off
+# GAME_OPT overrides the optimization level (R96: -O2 by default, -O1 before);
+# GAME_OBJ_TAG keeps its objects apart.
+flags=(-std=c++20 -march=znver2 -mcx16 ${GAME_OPT:--O2} -fPIC -fno-exceptions -fno-rtti -ffp-contract=off
    -ffunction-sections -fdata-sections -I "$RECOMP/include")
 
 game_object() {
@@ -54,7 +56,7 @@ export SDK VK
 export -f ps5_cc game_object compile_unit
 for name in "${modules[@]}"; do
    src=${lift[$name]}
-   out="$BUILD/obj/game-$name"
+   out="$BUILD/obj/game-$name${GAME_OBJ_TAG:-}"
    mkdir -p "$out"
    exec {lock_fd}>"$out/.compile.lock"
    flock "$lock_fd"
@@ -69,6 +71,8 @@ for name in "${modules[@]}"; do
    local_src="$BUILD/lift/$name"
    mkdir -p "$local_src"
    rsync -a --delete "$src/" "$local_src/"
+   # R96: port patches to the local lift (the frame limiter's target rate).
+   [[ $name == main ]] && python3 "$POKOPIA/ps5/build/patch-lift.py" "$local_src"
    units=("$local_src"/*.cpp)
    echo "==> $name: ${#units[@]} units, $jobs jobs"
    start=$SECONDS

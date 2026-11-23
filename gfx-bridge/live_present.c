@@ -2,6 +2,7 @@
 #include "live_present.h"
 #include "vk_ledger.h"
 #include "fsr_shaders.h"
+#include "ps_banner.h"
 #include "port_settings.h"
 
 #include <math.h>
@@ -209,7 +210,8 @@ static VkResult open_panel(PokopiaLivePresent *live, VkDeviceSize size, VkBuffer
     const VkBufferCreateInfo create = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, /* R96: the banner reads one */
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     VkResult result = vkCreateBuffer(device, &create, NULL, buffer);
     if (result != VK_SUCCESS)
@@ -700,6 +702,84 @@ static VkImageView fsr_input(PokopiaLivePresent *live, const PokopiaLiveFrame *f
     return view;
 }
 
+/* R96: the banner's buffer (white, black and shadow coverage packed per pixel)
+ * and its compute pipeline, writing the FSR output image in place. */
+static bool banner_build(PokopiaLivePresent *live)
+{
+    live->banner_tried = true;
+    VkDevice device = live->present->device;
+    void *pixels = NULL;
+    bool coherent = false;
+    const VkDeviceSize bytes = (VkDeviceSize)PS_BANNER_WIDTH * PS_BANNER_HEIGHT * 4;
+    if (open_panel(live, bytes, &live->banner_buffer, &live->banner_memory, &pixels, &coherent) != VK_SUCCESS)
+        return false;
+    uint32_t *packed = pixels;
+    for (size_t i = 0; i < (size_t)PS_BANNER_WIDTH * PS_BANNER_HEIGHT; ++i)
+        packed[i] = (uint32_t)ps_banner_white[i] | (uint32_t)ps_banner_black[i] << 8 | (uint32_t)ps_banner_shadow[i] << 16;
+    if (!coherent) {
+        const VkMappedMemoryRange range = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = live->banner_memory, .size = VK_WHOLE_SIZE,
+        };
+        vkFlushMappedMemoryRanges(device, 1, &range);
+    }
+    const VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+    };
+    const VkDescriptorSetLayoutCreateInfo set_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings,
+    };
+    if (vkCreateDescriptorSetLayout(device, &set_info, NULL, &live->banner_set_layout) != VK_SUCCESS)
+        return false;
+    const VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 20};
+    const VkPipelineLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+        .pSetLayouts = &live->banner_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &range,
+    };
+    if (vkCreatePipelineLayout(device, &layout_info, NULL, &live->banner_layout) != VK_SUCCESS)
+        return false;
+    const VkShaderModuleCreateInfo module_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof fsr_banner_spv, .pCode = fsr_banner_spv,
+    };
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &module_info, NULL, &module) != VK_SUCCESS)
+        return false;
+    const VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"},
+        .layout = live->banner_layout,
+    };
+    const VkResult made = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL,
+                                                   &live->banner_pipeline);
+    vkDestroyShaderModule(device, module, NULL);
+    if (made != VK_SUCCESS)
+        return false;
+    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    const VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = sizes,
+    };
+    if (vkCreateDescriptorPool(device, &pool_info, NULL, &live->banner_pool) != VK_SUCCESS)
+        return false;
+    const VkDescriptorSetAllocateInfo allocate = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = live->banner_pool,
+        .descriptorSetCount = 1, .pSetLayouts = &live->banner_set_layout,
+    };
+    if (vkAllocateDescriptorSets(device, &allocate, &live->banner_set) != VK_SUCCESS)
+        return false;
+    const VkDescriptorImageInfo image = {VK_NULL_HANDLE, live->fsr_storage_views[1], VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorBufferInfo buffer = {live->banner_buffer, 0, bytes};
+    const VkWriteDescriptorSet writes[] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, live->banner_set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+         &image, NULL, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, live->banner_set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         NULL, &buffer, NULL},
+    };
+    vkUpdateDescriptorSets(device, 2, writes, 0, NULL);
+    live->banner_ready = true;
+    return true;
+}
+
 static bool fsr_record(PokopiaLivePresent *live, VkCommandBuffer command, const PokopiaLiveFrame *frame,
                        VkRect2D crop, VkImage target)
 {
@@ -755,6 +835,24 @@ static bool fsr_record(PokopiaLivePresent *live, VkCommandBuffer command, const 
                             &live->fsr_sets[slot][1], 0, NULL);
     vkCmdPushConstants(command, live->fsr_layouts[1], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rcas, rcas);
     vkCmdDispatch(command, groups_x, groups_y, 1);
+    /* R96: the title banner, over the sharpened image. */
+    if (live->banner_alpha > 0.0f && !live->banner_tried)
+        banner_build(live);
+    if (live->banner_alpha > 0.0f && live->banner_ready && live->banner_x >= 0 && live->banner_y >= 0 &&
+        (uint32_t)live->banner_x + PS_BANNER_WIDTH <= present->extent.width &&
+        (uint32_t)live->banner_y + PS_BANNER_HEIGHT <= present->extent.height) {
+        barrier(command, live->fsr_images[1], general, general, compute, VK_ACCESS_SHADER_WRITE_BIT, compute,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        struct { int32_t x, y; uint32_t width, height; float alpha; } params = {
+            live->banner_x, live->banner_y, PS_BANNER_WIDTH, PS_BANNER_HEIGHT,
+            live->banner_alpha > 1.0f ? 1.0f : live->banner_alpha,
+        };
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, live->banner_pipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, live->banner_layout, 0, 1, &live->banner_set,
+                                0, NULL);
+        vkCmdPushConstants(command, live->banner_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
+        vkCmdDispatch(command, (PS_BANNER_WIDTH + 15) / 16, (PS_BANNER_HEIGHT + 15) / 16, 1);
+    }
     barrier(command, live->fsr_images[1], general, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, compute,
             VK_ACCESS_SHADER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT);
     barrier(command, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

@@ -3045,6 +3045,15 @@ static NvnFrontReplyKind run_draw_generic(NvnReplay *replay, uint64_t device, co
         if (dump_width_ok)
             dump_texture = draw.textures[i].texture;
     }
+    {
+        /* R96: the title screen is up while its logo texture is drawn. */
+        extern void *volatile pokopia_title_texture;
+        extern volatile int pokopia_title_drawn;
+        void *const title = pokopia_title_texture;
+        for (uint32_t i = 0; title && drawn && i < draw.texture_count; ++i)
+            if (draw.textures[i].texture == title)
+                pokopia_title_drawn = 1;
+    }
     const bool dump_shader = (stages[0].hash && !strcmp(stages[0].hash, nvn_replay_dump_hash)) ||
                              (stage_count > 1 && stages[1].hash && !strcmp(stages[1].hash, nvn_replay_dump_hash));
     if (drawn && nvn_replay_dump_pending && dump_width_ok && dump_shader && nvn_replay_dump_skip) {

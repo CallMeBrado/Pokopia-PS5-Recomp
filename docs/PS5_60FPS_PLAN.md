@@ -268,3 +268,25 @@ turning).
 Ruled out on the way: zero-filling textures sampled before anything wrote them (the bloom chain
 was the first suspect), and the 51 cloud-puff billboards (096c2fdc7931ecad), which only looked
 guilty because a dump of the HDR target after them already held the NaN.
+
+## R96: 120 Hz output and the game's own frame limiter (2026-11-22)
+
+- **120 Hz:** PS5_Vulkan offers only FIFO, but switches VideoOut to 119.88 Hz when the title's
+  `param.json` declares high frame rate (`attribute3` 0x80040 = 524352) and the display runs at
+  120 Hz; otherwise it measures the vblank and stays at 59.94 Hz. The surface takes the first
+  display mode, which is then the 120 Hz one.
+- **The 60 fps cap is the game's:** a faster guest clock (`debug/tickscale` 150) raised 59.7 fps to
+  79.7. The limiter (main module `0x710089df20`) targets `60.0f / f_710013fc00()` (which returns
+  1.0), sleeps 200 us steps until `elapsed >= freq / target`, then derives the frame's delta time
+  from the measured ticks. `ps5/build/patch-lift.py` replaces the 60.0f at `0x710089e1d4` with
+  `pokopia_frame_limit_bits()` (30, 60, or 1000 for Uncapped) at build time.
+- **Uncapped speeds parts of the game up:** with the limiter lifted it ran ~97 fps standing and
+  ~70 turning, but some systems step per frame assuming 60, so play runs fast above 60. The menu
+  keeps the option; 60 is the default.
+- **Above 60 the chain is work-bound:** main-thread update (~10 ms, including waiting for the replay
+  worker's previous frame) then render-thread recording (~6.6 ms), mostly serial; turning, the
+  replay worker reaches ~78% busy.
+- **Game code at -O2:** `compile-game.sh` now defaults to `-O2` (`GAME_OPT`, `GAME_OBJ_TAG` override
+  the level and keep objects apart).
+- Debug mailbox additions: `framecap` (30/60/0), `tickscale` (percent), `tickcallers` (1 counts
+  system-tick reads by caller, 2 logs them), `memfind`/`memread` (guest memory search and dump).
