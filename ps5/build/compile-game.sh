@@ -71,8 +71,7 @@ for name in "${modules[@]}"; do
    local_src="$BUILD/lift/$name"
    mkdir -p "$local_src"
    rsync -a --delete "$src/" "$local_src/"
-   # R96: port patches to the local lift (the frame limiter's target rate).
-   [[ $name == main ]] && python3 "$POKOPIA/ps5/build/patch-lift.py" "$local_src"
+   [[ $name == main ]] && python3 "$POKOPIA/ps5/build/patch-lift.py" "$local_src" "$out/c_112.o"
    units=("$local_src"/*.cpp)
    echo "==> $name: ${#units[@]} units, $jobs jobs"
    start=$SECONDS

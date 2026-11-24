@@ -22,7 +22,7 @@ REPO = HERE.parents[1]
 # Read or run by the builder besides the compiled sources and their headers.
 SCRIPTS = [
     "ps5/build/winbuild.py", "ps5/build/compile-runtime.sh", "ps5/build/patch-lift.py",
-    "ps5/build/compile-game.sh",
+    "ps5/build/compile-game.sh", "ps5/build/native-inflate.h",
     "ps5/build/prepare-packed-floats.py", "ps5/build/pack-shaders.py", "ps5/title/param.json",
     "cpu-probe/generate.py", "loader-probe/prepare.py", "sdk-bringup/worker-site.py",
     "sdk-bringup/graphics-sites.py", "gfx-bridge/build-romfs-index.py",

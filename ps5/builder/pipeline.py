@@ -372,7 +372,17 @@ class Builder:
     # --- source -------------------------------------------------------------------------------
     def make_source(self):
         if self.is_done("source"):
-            return
+            # Older work folders can hold both a completed build and an earlier
+            # copy of the scripts that compile the locally generated game.
+            game_build = ("ps5/build/patch-lift.py", "ps5/build/native-inflate.h", "ps5/build/winbuild.py")
+            def current(name):
+                shipped, staged = self.source / name, self.src / name
+                if not shipped.is_file():
+                    return not staged.is_file()
+                return staged.is_file() and staged.read_bytes() == shipped.read_bytes()
+            if all(current(name) for name in game_build):
+                return
+            (self.done_dir / "source").unlink()
         progress("source", 0, 1, "Copying the port's sources")
         if self.src.exists():
             shutil.rmtree(self.src)

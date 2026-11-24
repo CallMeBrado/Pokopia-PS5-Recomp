@@ -197,7 +197,8 @@ class Build:
             if not lift.is_dir():
                 raise Fail(f"missing lifted module {name}: {lift}")
             if name == "main":
-                self.run([sys.executable, str(HERE / "patch-lift.py"), str(lift)], "patch-lift")
+                self.run([sys.executable, str(HERE / "patch-lift.py"), str(lift),
+                          str(self.work / "obj/game-main/c_112.o")], "patch-lift")
                 result = self.run([sys.executable, str(HERE / "prepare-packed-floats.py"),
                                    str(self.cfg["recomp_include"] / "nxrecomp"),
                                    str(self.work / "packed-float32")] + flags, "packed floats")
