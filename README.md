@@ -8,6 +8,14 @@ See [LEGAL.md](LEGAL.md).
 **This repository contains no game code or data, and no builds are distributed.** You need your
 own copy of the game (version 2.0.1a), which you dump and recompile yourself.
 
+## Windows builder
+
+The [Windows builder](ps5/builder/) builds the title from your own dump. It can export a
+PS5 folder, an exFAT or UFS2 image for ShadowMountPlus, or upload the title directly to your
+PS5 over FTP. It uses an extracted game icon when available and includes a built-in fallback.
+The [builder workflow](.github/workflows/builder.yml) assembles the Windows package using
+the pinned toolchain release asset.
+
 ## What it does
 
 - **Recompiled game code** runs natively on the PS5's CPU (the recompiler output is generated

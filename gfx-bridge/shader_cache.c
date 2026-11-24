@@ -31,6 +31,7 @@ struct NvnShaderCache {
     CacheRow *rows;
     size_t count;
     size_t stage_col, status_col, size_col, resources_col, pack_offset_col;
+    size_t zbytes_col; /* R96: optional spv_zbytes, the zlib-compressed size in the pack (0: raw) */
     uint64_t pack_bytes;
 };
 
@@ -243,6 +244,7 @@ static NvnShaderCacheStatus index_rows(NvnShaderCache *cache, FILE *file, char *
     cache->size_col = header_column(line, "spv_bytes");
     cache->resources_col = header_column(line, "resources");
     cache->pack_offset_col = header_column(line, "spv_offset");
+    cache->zbytes_col = header_column(line, "spv_zbytes");
     if (cache->stage_col == SIZE_MAX || cache->status_col == SIZE_MAX ||
         cache->size_col == SIZE_MAX || cache->resources_col == SIZE_MAX)
         return NVN_SHADER_CACHE_INVALID_CACHE;
@@ -374,6 +376,7 @@ typedef struct {
     Field resources;
     size_t bytes;
     uint64_t offset;
+    size_t stored; /* R96: bytes in the pack: bytes when raw, the zlib stream's size when compressed */
 } ShaderRecord;
 
 static NvnShaderCacheStatus parse_shader_record(const NvnShaderCache *cache, const char *row,
@@ -397,13 +400,34 @@ static NvnShaderCacheStatus parse_shader_record(const NvnShaderCache *cache, con
         !parse_decimal(field_at(row, cache->size_col), &declared_bytes) ||
         declared_bytes < 20 || declared_bytes > MAX_SHADER_BYTES || declared_bytes % 4 || !resources.start)
         return NVN_SHADER_CACHE_INVALID_CACHE;
-    uint64_t offset = 0;
+    uint64_t offset = 0, zbytes = 0;
+    if (cache->zbytes_col != SIZE_MAX &&
+        (!parse_decimal(field_at(row, cache->zbytes_col), &zbytes) || zbytes > MAX_SHADER_BYTES))
+        return NVN_SHADER_CACHE_INVALID_CACHE;
+    const uint64_t stored = zbytes ? zbytes : declared_bytes;
     if (cache->pack_offset_col != SIZE_MAX &&
         (!parse_decimal(field_at(row, cache->pack_offset_col), &offset) || offset % 4 ||
-         offset > cache->pack_bytes || declared_bytes > cache->pack_bytes - offset))
+         offset > cache->pack_bytes || stored > cache->pack_bytes - offset))
         return NVN_SHADER_CACHE_INVALID_CACHE;
-    *record = (ShaderRecord){.resources = resources, .bytes = (size_t)declared_bytes, .offset = offset};
+    *record = (ShaderRecord){.resources = resources, .bytes = (size_t)declared_bytes, .offset = offset,
+                             .stored = (size_t)stored};
     return NVN_SHADER_CACHE_OK;
+}
+
+/* R96: a compressed pack entry is one zlib stream (zlib's uncompress, which
+ * Mesa links in on the PS5); other builds read raw packs only. */
+#if defined(__PROSPERO__)
+extern int uncompress(unsigned char *dest, unsigned long *dest_len, const unsigned char *source, unsigned long source_len);
+#endif
+static bool inflate_spirv(const uint8_t *stream, size_t stored, uint32_t *words, size_t bytes)
+{
+#if defined(__PROSPERO__)
+    unsigned long produced = bytes;
+    return uncompress((unsigned char *)words, &produced, stream, stored) == 0 && produced == bytes;
+#else
+    (void)stream; (void)stored; (void)words; (void)bytes;
+    return false;
+#endif
 }
 
 static NvnShaderCacheStatus load_spirv(const NvnShaderCache *cache, const ShaderRecord *record, NvnCachedShader *out)
@@ -420,12 +444,18 @@ static NvnShaderCacheStatus load_spirv(const NvnShaderCache *cache, const Shader
     if (!file)
         return packed ? NVN_SHADER_CACHE_IO : open_error();
     const size_t bytes = record->bytes;
+    const bool compressed = packed && record->stored != bytes;
     uint32_t *words = malloc(bytes);
+    uint8_t *stream = compressed ? malloc(record->stored) : NULL;
     NvnShaderCacheStatus result = NVN_SHADER_CACHE_OUT_OF_MEMORY;
-    if (words) {
+    if (words && (!compressed || stream)) {
         if (packed && seek_file(file, (int64_t)record->offset, SEEK_SET) != 0)
             result = NVN_SHADER_CACHE_IO;
-        else if (fread(words, 1, bytes, file) != bytes || (!packed && fgetc(file) != EOF) || ferror(file))
+        else if (compressed && (fread(stream, 1, record->stored, file) != record->stored || ferror(file)))
+            result = ferror(file) ? NVN_SHADER_CACHE_IO : NVN_SHADER_CACHE_INVALID_CACHE;
+        else if (compressed && !inflate_spirv(stream, record->stored, words, bytes))
+            result = NVN_SHADER_CACHE_INVALID_CACHE;
+        else if (!compressed && (fread(words, 1, bytes, file) != bytes || (!packed && fgetc(file) != EOF) || ferror(file)))
             result = ferror(file) ? NVN_SHADER_CACHE_IO : NVN_SHADER_CACHE_INVALID_CACHE;
         else if (!parse_entry(words, bytes / sizeof *words, out->stage, out->entry))
             result = NVN_SHADER_CACHE_INVALID_CACHE;
@@ -433,6 +463,7 @@ static NvnShaderCacheStatus load_spirv(const NvnShaderCache *cache, const Shader
             result = NVN_SHADER_CACHE_OK;
     }
     fclose(file);
+    free(stream);
     if (result != NVN_SHADER_CACHE_OK) {
         free(words);
         out->entry[0] = '\0';

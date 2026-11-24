@@ -61,7 +61,9 @@ def main():
         folder = output / f"lift-{base:x}"
         folder.mkdir(exist_ok=True)
         subprocess.run(
-            [sys.executable, "-m", "nxrecomp", "lift", str(rtld), str(folder),
+            # -c with an explicit path rather than -m: an embedded Python (-I, ._pth) has no cwd on sys.path.
+            [sys.executable, "-c", "import runpy, sys; sys.path.insert(0, '.'); sys.argv[0] = 'nxrecomp'; "
+             "runpy.run_module('nxrecomp', run_name='__main__')", "lift", str(rtld), str(folder),
              "--name", "rtld", "--base", hex(base), "--index", "3", "--game", "pkp",
              "--shards", "1", "--jobs", "1"],
             cwd=args.recompiler, env=env, check=True,

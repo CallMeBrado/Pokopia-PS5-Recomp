@@ -5687,7 +5687,10 @@ static bool init_fsp(ServiceSession *slot)
     }
     const char *root = shared->root;
 #else
-    const char *root = "/data/pokopia/romfs";
+    /* R96: a self-contained package (the Windows builder's folder, exFAT or
+     * .ffpkg export) carries the game data at /app0/romfs; a title copied
+     * without it reads the shared copy in /data/pokopia/romfs. */
+    const char *root = access("/app0/romfs/LI_C0_R.IDX", R_OK) == 0 ? "/app0/romfs" : "/data/pokopia/romfs";
 #endif
     hzn_fsp_init(&shared->service.fsp, root, write_guest, clone_fsp, shared);
     hzn_fsp_set_read_log(&shared->service.fsp, probe_log);

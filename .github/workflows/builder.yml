@@ -1,0 +1,100 @@
+# Builds the Pokopia PS5 Builder (the Windows program that turns a user's own Pokopia dump into the PS5
+# title) and, for a builder-v* tag, publishes it as a release. The zip holds no game data.
+#
+# The PS5 toolchain (SDK headers/stubs, RADV, native tooling) comes from this repository's
+# "toolchain-1" release (ps5/builder/make-toolchain-pack.py); make-release.py checks its SHA-256.
+name: Pokopia PS5 Builder
+
+on:
+  push:
+    tags: ["builder-v*"]
+  pull_request:
+    paths: ["ps5/builder/**", ".github/workflows/builder.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  builder:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the pipeline scripts
+        shell: pwsh
+        run: |
+          python -m py_compile ps5/builder/pipeline.py ps5/builder/make-release.py `
+            ps5/builder/make-toolchain-pack.py ps5/builder/mkpfs_exfat/exfat_writer.py `
+            ps5/build/winbuild.py ps5/build/pack-shaders.py ps5/build/patch-lift.py
+          python ps5/builder/pipeline.py --help
+
+      - name: Check exFAT export
+        shell: pwsh
+        run: |
+          @'
+          import json
+          import sys
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          sys.path.insert(0, "ps5/builder")
+          from mkpfs_exfat import write_exfat_image
+
+          with TemporaryDirectory() as temp:
+              root = Path(temp)
+              title = root / "title"
+              (title / "sce_sys").mkdir(parents=True)
+              (title / "sce_sys/param.json").write_text(json.dumps({"titleId": "PPSA94010"}))
+              payload = bytes(range(256)) * 1173
+              (title / "eboot.bin").write_bytes(payload)
+              image = write_exfat_image(title, root)
+              with image.open("rb") as stream:
+                  assert image.name == "PPSA94010.exfat"
+                  assert stream.read(11)[3:] == b"EXFAT   "
+                  assert payload in stream.read()
+          '@ | python -
+
+      - name: Build the window
+        shell: pwsh
+        run: dotnet build ps5/builder/app/PokopiaPS5Builder.csproj -c Release -o build/app
+
+      - name: Fetch the pinned toolchain
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download toolchain-1 --pattern toolchain-1.zip --dir build
+          if ($LASTEXITCODE -ne 0) { throw "The toolchain-1 release asset is required to assemble the builder." }
+          $expected = python -c "import runpy; print(runpy.run_path('ps5/builder/make-release.py')['TOOLCHAIN'][1])"
+          if ((Get-FileHash build/toolchain-1.zip -Algorithm SHA256).Hash -ne $expected) {
+              throw "The toolchain release asset does not match the pinned SHA-256."
+          }
+
+      - name: Assemble the release
+        shell: pwsh
+        run: python ps5/builder/make-release.py --app build/app --out dist --toolchain-zip build/toolchain-1.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PokopiaPS5Builder
+          path: dist/PokopiaPS5Builder-*.zip
+          compression-level: 0
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/builder-v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem dist/PokopiaPS5Builder-*.zip | Select-Object -First 1
+          $notes = @"
+          Pokopia PS5 Builder: builds the PS5 version of Pokopia (PPSA94010) from your own dump of
+          Pokopia 2.0.1 (update 655360). Unzip, run PokopiaPS5Builder.exe, pick your dump and an output
+          folder, and choose a folder, exFAT, UFS2 .ffpkg, or FTP upload to your PS5. See README.txt.
+          "@
+          gh release create "${{ github.ref_name }}" $zip.FullName --title "Pokopia PS5 Builder ${{ github.ref_name }}" --notes $notes
