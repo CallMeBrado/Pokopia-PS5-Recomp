@@ -336,7 +336,7 @@ static void test_overlay(PokopiaPresent *present, PokopiaGameCapture *capture)
     assert(pokopia_live_present_init(&live, HANDLE(VkPhysicalDevice, 5), present,
         HANDLE(VkCommandBuffer, 6), capture) == VK_SUCCESS);
 
-    const char *const lines[4] = {"POKOPIA PS4", "VIDEO READY", "WAITING FOR GAME", "DEBUG STATUS"};
+    const char *const lines[POKOPIA_OVERLAY_LINES] = {"POKOPIA PS5", "VIDEO READY", "WAITING FOR GAME", "DEBUG STATUS"};
     assert(pokopia_live_present_overlay_update(&live, lines) == VK_SUCCESS);
     assert(trace.overlay_allocations == 1 && !trace.overlay_flushes && !trace.acquires);
     bool dark = false, bright = false;

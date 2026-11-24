@@ -1,10 +1,36 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#if defined(__PROSPERO__)
+/* The native process record uses BSD types in the pinned platform headers. */
+#undef _XOPEN_SOURCE
+#else
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "orbis_memory.h"
 #include "../horizon/heap.h"
 
 #include <inttypes.h>
 #include <orbis/libkernel.h>
+
+#if defined(__PROSPERO__)
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include <unistd.h>
+
+uint64_t pokopia_orbis_process_rss_bytes(void)
+{
+    const pid_t pid = getpid();
+    const int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+    struct kinfo_proc process;
+    size_t available = sizeof process;
+    if (sysctl(mib, sizeof mib / sizeof mib[0], &process, &available, NULL, 0) != 0 ||
+        available != sizeof process || process.ki_structsize != (int)sizeof process || process.ki_pid != pid ||
+        process.ki_rssize <= 0)
+        return 0;
+    const long page_bytes = sysconf(_SC_PAGESIZE);
+    return page_bytes > 0 ? (uint64_t)process.ki_rssize * (uint64_t)page_bytes : 0;
+}
+
+#endif
 
 /* The bundled OpenOrbis header declares these output arguments by value.
  * Bind to the same exports using the pointer ABI from orbis-compat. */

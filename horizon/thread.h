@@ -49,6 +49,7 @@ HznThreads *hzn_threads_create(const HznThreadConfig *config);
 #if defined(__PROSPERO__)
 /* Temporarily bind the calling host thread to a core in its allowed set. */
 void hzn_thread_test_affinity(unsigned cpu_rank, bool enabled);
+unsigned hzn_thread_process_cpu_count(void);
 #endif
 
 /* Run before other SVC handlers so workers can observe process teardown at

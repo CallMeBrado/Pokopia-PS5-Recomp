@@ -372,16 +372,28 @@ class Builder:
     # --- source -------------------------------------------------------------------------------
     def make_source(self):
         if self.is_done("source"):
-            # Older work folders can hold both a completed build and an earlier
-            # copy of the scripts that compile the locally generated game.
+            # Completed work folders can retain older build scripts and runtime inputs.
             game_build = ("ps5/build/patch-lift.py", "ps5/build/native-inflate.h", "ps5/build/winbuild.py")
+            runtime_inputs = {
+                "boot/r41-cold-check/loader_native.c": ("loader_native",),
+                "gfx-bridge/debug_overlay_pixels.h": ("loader_native", "live_present"),
+                "gfx-bridge/orbis_memory.c": ("orbis_memory",),
+                "gfx-bridge/orbis_memory.h": ("loader_native", "orbis_memory"),
+                "horizon/thread.c": ("thread",),
+                "horizon/thread.h": ("loader_native", "thread"),
+            }
+
             def current(name):
                 shipped, staged = self.source / name, self.src / name
                 if not shipped.is_file():
                     return not staged.is_file()
                 return staged.is_file() and staged.read_bytes() == shipped.read_bytes()
-            if all(current(name) for name in game_build):
+
+            outdated = {obj for path, objects in runtime_inputs.items() if not current(path) for obj in objects}
+            if not outdated and all(current(name) for name in game_build):
                 return
+            for obj in outdated:
+                (self.work / "build" / "obj" / "runtime" / f"{obj}.o").unlink(missing_ok=True)
             (self.done_dir / "source").unlink()
         progress("source", 0, 1, "Copying the port's sources")
         if self.src.exists():

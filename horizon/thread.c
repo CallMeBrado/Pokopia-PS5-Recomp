@@ -359,6 +359,13 @@ static int ps5_get_process_cpus(cpuset_t *set, size_t *used)
     return err;
 }
 
+unsigned hzn_thread_process_cpu_count(void)
+{
+    cpuset_t set;
+    size_t used;
+    return ps5_get_process_cpus(&set, &used) == 0 ? (unsigned)CPU_COUNT(&set) : 0;
+}
+
 static int ps5_get_thread_cpus(cpuset_t *set, size_t *used)
 {
     int err = ERANGE;

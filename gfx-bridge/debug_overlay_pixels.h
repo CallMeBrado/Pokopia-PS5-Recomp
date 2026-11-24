@@ -6,7 +6,12 @@
 #include <stdint.h>
 #include <string.h>
 
-enum { POKOPIA_OVERLAY_WIDTH = 420, POKOPIA_OVERLAY_HEIGHT = 88, POKOPIA_OVERLAY_LINES = 4 };
+#if defined(__PROSPERO__)
+enum { POKOPIA_OVERLAY_LINES = 6 };
+#else
+enum { POKOPIA_OVERLAY_LINES = 4 };
+#endif
+enum { POKOPIA_OVERLAY_WIDTH = 420, POKOPIA_OVERLAY_HEIGHT = 8 + POKOPIA_OVERLAY_LINES * 20 };
 /* R75: the one-line frame-rate panel in the top-right corner. */
 enum { POKOPIA_FPS_WIDTH = 128, POKOPIA_FPS_HEIGHT = 30 };
 

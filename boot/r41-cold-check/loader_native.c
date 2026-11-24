@@ -11,6 +11,7 @@
 #include <pthread.h>
 #if defined(__PROSPERO__)
 #include <pthread_np.h>
+#include <sys/resource.h>
 #endif
 #include <signal.h>
 #include <stdatomic.h>
@@ -221,6 +222,13 @@ static PokopiaLiveTextureUpload texture_upload;
 static NvnShaderCache *shaders;
 #ifndef _WIN32
 static PokopiaLivePresent live_output;
+
+static unsigned active_frame_cap(void)
+{
+    const int override = pokopia_frame_cap_override;
+    return override >= 0 ? (unsigned)override : pokopia_settings.frame_cap;
+}
+
 #if defined(__PROSPERO__)
 /* R86: while the on-screen keyboard is up the guest sees an idle pad and the
  * keyboard gets the real one; the last presented game image is re-shown behind
@@ -265,8 +273,7 @@ static void port_settings_once(void)
  * refresh (FIFO) is then the limit. debug/framecap overrides the menu. */
 uint32_t pokopia_frame_limit_bits(void)
 {
-    const int override = pokopia_frame_cap_override;
-    const unsigned cap = override >= 0 ? (unsigned)override : pokopia_settings.frame_cap;
+    const unsigned cap = active_frame_cap();
     const float fps = cap == 30 ? 30.0f : cap == 0 ? 1000.0f : 60.0f;
     uint32_t bits;
     memcpy(&bits, &fps, sizeof bits);
@@ -328,8 +335,10 @@ static struct {
 static PokopiaGameCapture live_capture;
 static VkCommandBuffer live_present_command;
 static _Atomic(const char *) overlay_stop;
-static uint64_t overlay_started_ms, overlay_texture_objects;
-static bool overlay_asset_read, overlay_ditto_drawn, overlay_disabled;
+static bool overlay_disabled;
+#if defined(__PROSPERO__)
+static int overlay_gpu_draw_percent = -1;
+#endif
 #endif
 #if defined(__PROSPERO__)
 /* R70: virtual controller from /data/pokopia/debug/pad.req (see
@@ -1559,8 +1568,11 @@ static void report_thread_stats(FILE *log)
     fputc('\n', log);
 }
 
-static void report_stat_names(FILE *log)
+static void report_stat_names(FILE *log, uint64_t window_ns)
 {
+#if !defined(__PROSPERO__) || !defined(POKOPIA_GFX)
+    (void)window_ns;
+#endif
     StatName copy[STAT_NAMES];
     while (atomic_flag_test_and_set_explicit(&stat_names_lock, memory_order_acquire))
         __builtin_ia32_pause();
@@ -1631,6 +1643,14 @@ static void report_stat_names(FILE *log)
             fprintf(log, "GPU draw batches=%" PRIu64 " busy_ms=%.1f | linear sync ms=%.1f compares=%" PRIu64
                          " MiB=%.0f\n", pokopia_gpu_batches, pokopia_gpu_batch_ns * 1e-6, pokopia_linear_sync_ns * 1e-6,
                     pokopia_linear_sync_calls, pokopia_linear_sync_bytes / 1048576.0);
+#if defined(__PROSPERO__) && defined(POKOPIA_GFX)
+            /* Share the existing timestamp window with the HUD. These spans cover draw batches. */
+            overlay_gpu_draw_percent = -1;
+            if (pokopia_gpu_batches && window_ns) {
+                const double usage = 100.0 * (double)pokopia_gpu_batch_ns / (double)window_ns;
+                overlay_gpu_draw_percent = (int)(usage >= 100.0 ? 100.0 : usage + 0.5);
+            }
+#endif
             pokopia_gpu_batches = pokopia_gpu_batch_ns = 0;
             pokopia_linear_sync_ns = pokopia_linear_sync_calls = pokopia_linear_sync_bytes = 0;
             fprintf(log, "Present GPU-behind waits=%" PRIu64 " ms=%.1f | acquire ms=%.1f | readbacks shadow=%" PRIu64
@@ -3051,7 +3071,7 @@ static void report_load_stats(void)
             fprintf(probe_log, " %#x=%" PRIu64 "/%.0fms", number, calls, ns * ms);
     }
     fputc('\n', probe_log);
-    report_stat_names(probe_log);
+    report_stat_names(probe_log, window);
     report_thread_stats(probe_log);
     nvn_replay_report_skips(probe_log);
     fprintf(probe_log, "Stats report previous ms=%.2f tid=%" PRIu64 "\n", report_ns * ms, pokopia_trace_guest_tid());
@@ -3122,7 +3142,6 @@ static NvnFrontTextureCreateResult create_nvn_texture(void *opaque, void *device
     }
     *object = texture;
 #ifndef _WIN32
-    ++overlay_texture_objects;
 #endif
     if (!is_texel && texture->deferred)
         register_cold_texture(info);
@@ -3474,16 +3493,11 @@ static bool execute_nvn_draw(void *opaque, const PokopiaLiveDraw *draw)
     if (result == VK_SUCCESS)
         result = pokopia_live_draw(opaque, draw, &serial);
     static unsigned loading_draws_logged;
-    bool check_loading_draw = loading_draws_logged < 4;
-#ifndef _WIN32
-    check_loading_draw |= !overlay_ditto_drawn;
-#endif
+    const bool check_loading_draw = loading_draws_logged < 4;
     const bool loading_draw = check_loading_draw && draw->vertex_shader.hash && draw->fragment_shader.hash &&
         !strcmp(draw->vertex_shader.hash, "a26763a4bdd7b361") &&
         !strcmp(draw->fragment_shader.hash, "2db3327d9fbc5bb3");
 #ifndef _WIN32
-    if (loading_draw && result == VK_SUCCESS)
-        overlay_ditto_drawn = true;
     /* R60: mark frames that draw the Ditto loading screen for the frame cap. */
     if (draw->fragment_shader.hash && !strcmp(draw->fragment_shader.hash, "2db3327d9fbc5bb3"))
         atomic_store_explicit(&frame_has_loading_draw, true, memory_order_relaxed);
@@ -3904,7 +3918,55 @@ static uint64_t overlay_clock_ms(void)
     return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
 }
 
-static bool refresh_live_overlay(void)
+#if defined(__PROSPERO__)
+static bool overlay_process_cpu_us(uint64_t *cpu_us)
+{
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        *cpu_us = ((uint64_t)usage.ru_utime.tv_sec + (uint64_t)usage.ru_stime.tv_sec) * UINT64_C(1000000) +
+                  (uint64_t)usage.ru_utime.tv_usec + (uint64_t)usage.ru_stime.tv_usec;
+        return true;
+    }
+    struct timespec cpu;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu) != 0)
+        return false;
+    *cpu_us = (uint64_t)cpu.tv_sec * UINT64_C(1000000) + (uint64_t)cpu.tv_nsec / 1000;
+    return true;
+}
+
+typedef struct {
+    int cpu_percent;
+    uint64_t rss_bytes, guest_heap_bytes;
+} OverlayUsage;
+
+static OverlayUsage overlay_usage(uint64_t now_ms)
+{
+    static OverlayUsage usage = {.cpu_percent = -1};
+    static uint64_t previous_ms, previous_cpu_us;
+    static bool previous_cpu_valid;
+    static unsigned cpu_count;
+    if (!now_ms || (previous_ms && now_ms - previous_ms < 1000))
+        return usage;
+    if (!cpu_count)
+        cpu_count = hzn_thread_process_cpu_count();
+    uint64_t cpu_us = 0;
+    const bool cpu_valid = cpu_count && overlay_process_cpu_us(&cpu_us);
+    const uint64_t elapsed_ms = now_ms - previous_ms;
+    usage.cpu_percent = -1;
+    if (cpu_valid && previous_cpu_valid && elapsed_ms <= 3000 && cpu_us >= previous_cpu_us) {
+        const double share = (double)(cpu_us - previous_cpu_us) / (10.0 * (double)elapsed_ms * cpu_count);
+        usage.cpu_percent = (int)(share >= 100.0 ? 100.0 : share + 0.5);
+    }
+    previous_ms = now_ms;
+    previous_cpu_us = cpu_us;
+    previous_cpu_valid = cpu_valid;
+    usage.rss_bytes = pokopia_orbis_process_rss_bytes();
+    usage.guest_heap_bytes = pokopia_boot_heap_size();
+    return usage;
+}
+#endif
+
+static bool refresh_live_overlay(const PokopiaLiveFrame *frame, double fps)
 {
     static uint64_t next_update_ms;
     static const char *last_phase;
@@ -3912,35 +3974,68 @@ static bool refresh_live_overlay(void)
         return false;
 
     const char *reason = atomic_load_explicit(&overlay_stop, memory_order_relaxed);
-    const char *phase = "VIDEO READY / STARTING GAME";
-    if (reason)
-        phase = reason;
-    else if (overlay_ditto_drawn)
-        phase = "DITTO LOADING SCREEN DRAWN";
-    else if (overlay_asset_read)
-        phase = "GAME DATA READ / LOADING";
-    else if (cold_present)
-        phase = "WAITING FOR GAME DATA";
-
+    const char *phase = reason ? reason : frame ? NULL : "STARTING GAME";
     const uint64_t now = overlay_clock_ms();
     if (now && now < next_update_ms && phase == last_phase)
         return true;
 
-    char title[35] = "POKOPIA PS4";
-    char status[35], frames[35], textures[35];
-#ifdef POKOPIA_GAME_BOOT
-    snprintf(title, sizeof title, "POKOPIA PS4  R%d", POKOPIA_GAME_BOOT);
+#if defined(__PROSPERO__)
+    const char *title = "POKOPIA PS5 DEBUG";
+#else
+    const char *title = "POKOPIA PS4 DEBUG";
 #endif
-    snprintf(status, sizeof status, "%s%.29s", reason ? "STOP " : "", phase);
-    const uint64_t elapsed = now >= overlay_started_ms ? (now - overlay_started_ms) / 1000 : 0;
-    snprintf(frames, sizeof frames, "TIME %" PRIu64 "S  FRAMES %" PRIu64, elapsed, cold_present);
-    snprintf(textures, sizeof textures, "TEX %" PRIu64 "  PAGED %" PRIu64 " MIB",
-        overlay_texture_objects, cold_parked / (1024 * 1024));
-    const char *const lines[POKOPIA_OVERLAY_LINES] = {title, status, frames, textures};
+    char timing[35], pacing[35], resolution[35];
+    if (phase)
+        snprintf(timing, sizeof timing, "%s%.29s", reason ? "STOP " : "", phase);
+    else if (fps > 0)
+        snprintf(timing, sizeof timing, "%.1f FPS  %.1f MS AVG", fps, 1000.0 / fps);
+    else
+        snprintf(timing, sizeof timing, "FPS --  -- MS AVG");
+
+    const unsigned cap = active_frame_cap();
+    char cap_text[11] = "OFF";
+    if (cap)
+        snprintf(cap_text, sizeof cap_text, "%u", cap);
+    const uint32_t refresh_mhz = pokopia_present_refresh_mhz;
+    if (refresh_mhz)
+        snprintf(pacing, sizeof pacing, "CAP %s  DISPLAY %.2f HZ", cap_text, refresh_mhz / 1000.0);
+    else
+        snprintf(pacing, sizeof pacing, "CAP %s  DISPLAY -- HZ", cap_text);
+
+    const VkExtent2D output = live_output.present->extent;
+    if (frame) {
+        const VkExtent2D crop = frame->crop.extent;
+        const VkExtent2D render = crop.width && crop.height ? crop : frame->extent;
+        snprintf(resolution, sizeof resolution, "RENDER %uX%u / OUT %uX%u",
+                 render.width, render.height, output.width, output.height);
+    } else {
+        snprintf(resolution, sizeof resolution, "RENDER -- / OUT %uX%u", output.width, output.height);
+    }
+#if defined(__PROSPERO__)
+    char loads[35], memory[35];
+    char cpu_text[5] = "--", gpu_text[5] = "--";
+    const OverlayUsage usage = frame ? overlay_usage(now) : (OverlayUsage){.cpu_percent = -1};
+    if (usage.cpu_percent >= 0)
+        snprintf(cpu_text, sizeof cpu_text, "%u%%", (unsigned)usage.cpu_percent);
+    if (overlay_gpu_draw_percent >= 0)
+        snprintf(gpu_text, sizeof gpu_text, "%u%%", (unsigned)overlay_gpu_draw_percent);
+    snprintf(loads, sizeof loads, "CPU %s  GPU DRAW %s", cpu_text, gpu_text);
+    const double gib = 1.0 / 1073741824.0;
+    if (usage.rss_bytes)
+        snprintf(memory, sizeof memory, "RSS %.2f GIB  HEAP %.2f GIB",
+                 usage.rss_bytes * gib, usage.guest_heap_bytes * gib);
+    else if (usage.guest_heap_bytes)
+        snprintf(memory, sizeof memory, "GUEST HEAP %.2f GIB", usage.guest_heap_bytes * gib);
+    else
+        snprintf(memory, sizeof memory, "MEMORY --");
+    const char *const lines[POKOPIA_OVERLAY_LINES] = {title, timing, pacing, resolution, loads, memory};
+#else
+    const char *const lines[POKOPIA_OVERLAY_LINES] = {title, timing, pacing, resolution};
+#endif
     const VkResult result = pokopia_live_present_overlay_update(&live_output, lines);
     if (result != VK_SUCCESS) {
         overlay_disabled = true;
-        fprintf(probe_log, "Live PS4 debug overlay unavailable (%d)\n", result);
+        fprintf(probe_log, "Live debug overlay unavailable (%d)\n", result);
         fflush(probe_log);
         return false;
     }
@@ -3965,12 +4060,12 @@ static bool open_live_output(void)
                                       live_present_command, capture);
     if (result != VK_SUCCESS)
         return false;
-    if (refresh_live_overlay()) {
+    if (refresh_live_overlay(NULL, 0)) {
         result = pokopia_live_present_show_overlay(&live_output, UINT64_C(5000000000));
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
-            fputs("Live PS4 debug overlay startup frame submitted\n", probe_log);
+            fputs("Live debug overlay startup frame submitted\n", probe_log);
         else
-            fprintf(probe_log, "Live PS4 debug startup frame failed (%d)\n", result);
+            fprintf(probe_log, "Live debug startup frame failed (%d)\n", result);
         fflush(probe_log);
     }
     return !graphics.present.faulted;
@@ -4000,8 +4095,7 @@ static NvnFrontReplyKind present_nvn_frame(const uint64_t x[32])
      * (60 fps at 120 Hz, 30 at 60 Hz) or four vblanks. Uncapped (0), and a
      * cap at or above the display's refresh, do not sleep: the game then
      * runs up to the display's refresh. debug/framecap overrides the menu. */
-    const unsigned frame_cap = pokopia_frame_cap_override >= 0 ? (unsigned)pokopia_frame_cap_override
-                                                               : pokopia_settings.frame_cap;
+    const unsigned frame_cap = active_frame_cap();
     const uint32_t refresh_mhz = pokopia_present_refresh_mhz ? pokopia_present_refresh_mhz : 59940;
     if (frame_cap && frame_cap * 1000u < refresh_mhz - 1000u) {
         static uint64_t cap_due;
@@ -4078,38 +4172,43 @@ static NvnFrontReplyKind present_nvn_frame_execute(const uint64_t x[32])
     VkResult shot = VK_NOT_READY;
     replay_drain(); /* R77: the frame's queued replay jobs first */
     pokopia_vk_flush_pending(POKOPIA_FLUSH_PRESENT);
-    refresh_live_overlay();
-    {
-        /* R75: game flips per second, refreshed once a second, top-right. */
-        static uint64_t fps_window_ns, fps_frames;
-        static bool fps_disabled, fps_shown;
-        const uint64_t now_ns = pokopia_boot_monotonic_ns();
-        if (!fps_window_ns)
-            fps_window_ns = now_ns;
+    /* Use the same one-second sample for the optional FPS counter and debug panel. */
+    static uint64_t fps_window_ns, fps_frames;
+    static double fps;
+    static bool fps_disabled, fps_shown;
+    const uint64_t now_ns = pokopia_boot_monotonic_ns();
+    if (!fps_window_ns)
+        fps_window_ns = now_ns;
+    else
         ++fps_frames;
-        const uint64_t span_ns = now_ns - fps_window_ns;
-        if (!fps_disabled && (!fps_shown || span_ns >= UINT64_C(1000000000))) {
-            char text[16];
-            if (fps_shown && span_ns)
-                snprintf(text, sizeof text, "FPS %.1f", (double)fps_frames * 1e9 / (double)span_ns);
-            else
-                snprintf(text, sizeof text, "FPS --");
-            const VkResult fps_result = pokopia_live_present_fps_update(&live_output, text);
-            if (fps_result == VK_SUCCESS) {
-                fps_shown = true;
-                fps_window_ns = now_ns;
-                fps_frames = 0;
-            } else if (fps_result == VK_ERROR_FEATURE_NOT_PRESENT || fps_result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
-                       fps_result == VK_ERROR_OUT_OF_HOST_MEMORY) {
-                fps_disabled = true;
-                fprintf(probe_log, "Live FPS counter unavailable (%d)\n", (int)fps_result);
-                fflush(probe_log);
-            }
+    const uint64_t span_ns = now_ns - fps_window_ns;
+    const bool sampled = span_ns >= UINT64_C(1000000000);
+    if (sampled) {
+        fps = (double)fps_frames * 1e9 / (double)span_ns;
+        fps_window_ns = now_ns;
+        fps_frames = 0;
+    }
+    if (!fps_disabled && (!fps_shown || sampled)) {
+        char text[16];
+        if (fps > 0)
+            snprintf(text, sizeof text, "FPS %.1f", fps);
+        else
+            snprintf(text, sizeof text, "FPS --");
+        const VkResult fps_result = pokopia_live_present_fps_update(&live_output, text);
+        if (fps_result == VK_SUCCESS) {
+            fps_shown = true;
+        } else if (fps_result == VK_ERROR_FEATURE_NOT_PRESENT || fps_result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+                   fps_result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            fps_disabled = true;
+            fprintf(probe_log, "Live FPS counter unavailable (%d)\n", (int)fps_result);
+            fflush(probe_log);
         }
     }
     /* R92: port settings: overlays shown or hidden, the menu drawn when it changed. */
     live_output.fps_hidden = !pokopia_settings.fps_counter;
     live_output.overlay_hidden = !pokopia_settings.debug_info;
+    if (!live_output.overlay_hidden)
+        refresh_live_overlay(&frame, fps);
     if (atomic_exchange_explicit(&menu_dirty, false, memory_order_acq_rel) && live_output.present) {
         pthread_mutex_lock(&pad_mutex);
         const PokopiaMenu menu = port_menu;
@@ -6104,10 +6203,6 @@ static bool service_manager_svc(Ctx *context, uint32_t number)
             fputs("Pokopia RomFS opened from verified local game data\n", probe_log);
             fflush(probe_log);
         }
-#ifndef _WIN32
-        if (fsp->first_asset_read)
-            overlay_asset_read = true;
-#endif
         context->x[0] = reply.result;
         return true;
     }
@@ -7085,9 +7180,6 @@ int pokopia_guest_probe(FILE *log)
 #if defined(POKOPIA_GFX) && !defined(_WIN32) && !defined(__PROSPERO__)
     /* PS4 only: there is no Gnm on the PS5; RADV submits through AGC. */
     start_submit_done_heartbeat();
-#endif
-#if defined(POKOPIA_GFX) && !defined(_WIN32)
-    overlay_started_ms = overlay_clock_ms();
 #endif
 #if defined(POKOPIA_GFX) && !defined(_WIN32) && defined(POKOPIA_ORBIS_MEMORY_TRACE)
     pokopia_orbis_memory_trace_start();

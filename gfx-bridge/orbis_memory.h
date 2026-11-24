@@ -2,11 +2,16 @@
 #ifndef POKOPIA_ORBIS_MEMORY_H
 #define POKOPIA_ORBIS_MEMORY_H
 
+#include <stdint.h>
 #include <stdio.h>
 
 /* Log a native snapshot of the direct and flexible memory pools. */
 void pokopia_orbis_memory_census(FILE *log, const char *phase);
 
+#if defined(__PROSPERO__)
+/* Current process resident bytes, or zero when the kernel record is unavailable. */
+uint64_t pokopia_orbis_process_rss_bytes(void);
+#endif
 #ifdef POKOPIA_ORBIS_MEMORY_TRACE
 void pokopia_orbis_memory_trace_start(void);
 void pokopia_orbis_memory_trace_flush(FILE *log);
