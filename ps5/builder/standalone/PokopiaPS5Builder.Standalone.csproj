@@ -7,7 +7,7 @@
     <AssemblyName>PokopiaPS5Builder</AssemblyName>
     <ApplicationIcon>../app/app.ico</ApplicationIcon>
     <ApplicationManifest>../app/app.manifest</ApplicationManifest>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Product>Pokopia PS5 Builder</Product>
     <Copyright>GPL-3.0-or-later</Copyright>
     <ManifestPath>$(BaseIntermediateOutputPath)$(Configuration)/standalone-manifest.txt</ManifestPath>
