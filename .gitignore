@@ -17,6 +17,11 @@
 !Makefile
 !.gitignore
 
+# Screenshots used by the README
+!/docs/screenshots/title-screen.webp
+!/docs/screenshots/outdoor-gameplay.webp
+!/docs/screenshots/port-settings.webp
+
 # Never track these trees
 upstream/
 toolchain/*
