@@ -5,7 +5,7 @@ the static recompilation from [Pokopia Recomp](https://github.com/drakolordx7/po
 Not affiliated with Nintendo, The Pokémon Company, Creatures, GAME FREAK, KOEI TECMO or Sony.
 See [LEGAL.md](LEGAL.md).
 
-**This repository contains no game code or data, and no builds are distributed.** You need your
+**This repository contains no game code or data, and no game builds are distributed.** You need your
 own copy of the game (version 2.0.1a), which you dump and recompile yourself.
 
 ## Windows builder
@@ -13,8 +13,9 @@ own copy of the game (version 2.0.1a), which you dump and recompile yourself.
 The [Windows builder](ps5/builder/) builds the title from your own dump. It can export a
 PS5 folder, an exFAT or UFS2 image for ShadowMountPlus, or upload the title directly to your
 PS5 over FTP. It uses an extracted game icon when available and includes a built-in fallback.
-The [builder workflow](.github/workflows/builder.yml) assembles the Windows package using
-the pinned toolchain release asset.
+Download **PokopiaPS5Builder.exe** from [Releases](https://github.com/CallMeBrado/Pokopia-PS5-Recomp/releases/latest) and open it. It unpacks its
+supporting files on first launch. The [builder workflow](.github/workflows/builder.yml)
+reuses the pinned toolchain embedded in the initial standalone release.
 
 ## What it does
 

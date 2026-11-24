@@ -5,7 +5,8 @@
     python make-release.py --app <PokopiaPS5Builder.exe build folder> --out <dist folder>
                            [--toolchain-zip toolchain-1.zip] [--python-zip python-...-embed-amd64.zip]
 
-Without --toolchain-zip / --python-zip the pinned downloads below are used (the release workflow).
+Pass the pinned toolchain ZIP. The release workflow recovers it from the standalone builder.
+Without --python-zip, the script fetches the pinned embedded Python ZIP.
 The result holds no game data: the builder makes everything game-derived on the user's PC.
 
     PokopiaPS5Builder/
@@ -30,8 +31,7 @@ VERSION = (HERE / "VERSION").read_text(encoding="ascii").strip()
 
 PYTHON = ("https://www.python.org/ftp/python/3.13.17/python-3.13.17-embed-amd64.zip",
           "9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38")
-TOOLCHAIN = ("https://github.com/CallMeBrado/Pokopia-PS5-Recomp/releases/download/toolchain-1/toolchain-1.zip",
-             "1a1357e763a6ed6c21a32d33f00cafd7cf08e6a8ed83d723fc1c7801c6447684")
+TOOLCHAIN_SHA256 = "1a1357e763a6ed6c21a32d33f00cafd7cf08e6a8ed83d723fc1c7801c6447684"
 
 BUILDER_FILES = ["pipeline.py", "shader_order.txt", "default-icon0.png"]
 
@@ -88,12 +88,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--app", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--toolchain-zip", type=Path)
+    ap.add_argument("--toolchain-zip", required=True, type=Path)
     ap.add_argument("--python-zip", type=Path)
+    ap.add_argument("--launcher-payload", action="store_true",
+                    help="build the launcher payload ZIP with the toolchain packaged as a separate resource")
     a = ap.parse_args()
     cache = a.out / "downloads"
     python_zip = a.python_zip or fetch(*PYTHON, cache)
-    toolchain_zip = a.toolchain_zip or fetch(*TOOLCHAIN, cache)
+    toolchain_zip = a.toolchain_zip
+    with toolchain_zip.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != TOOLCHAIN_SHA256:
+            sys.exit(f"{toolchain_zip} does not match the pinned toolchain SHA-256")
 
     root = a.out / "PokopiaPS5Builder"
     if root.exists():
@@ -120,9 +125,10 @@ def main():
         shutil.copy2(REPO / rel, dest)
 
     with zipfile.ZipFile(toolchain_zip) as z:
-        z.extractall(root)
-    if not (root / "toolchain/VERSION").exists():
-        sys.exit(f"{toolchain_zip} is not a toolchain pack")
+        if "toolchain/VERSION" not in z.namelist():
+            sys.exit(f"{toolchain_zip} is not a toolchain pack")
+        if not a.launcher_payload:
+            z.extractall(root)
     with zipfile.ZipFile(python_zip) as z:
         z.extractall(root / "python")
 
@@ -132,7 +138,8 @@ def main():
         shutil.copy2(license_file, root / "LICENSE.txt")
         shutil.copy2(license_file, source / "LICENSE")
 
-    archive = a.out / f"PokopiaPS5Builder-{VERSION}.zip"
+    filename = "PokopiaPS5Builder-payload.zip" if a.launcher_payload else f"PokopiaPS5Builder-{VERSION}.zip"
+    archive = a.out / filename
     if archive.exists():
         archive.unlink()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:

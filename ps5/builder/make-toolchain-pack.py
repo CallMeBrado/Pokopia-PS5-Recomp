@@ -6,7 +6,7 @@ The pack holds no game data and nothing of Sony's: the PS5 payload SDK headers a
 (mihawk-99/PS5_PayloadSDK), the RADV Vulkan driver archive (mihawk-99/PS5_Mesa), PS5_Vulkan's native
 title tooling (app runtime, clean-room libc.prx, link scripts, ps5-native-tool), the compiler-rt
 builtins, Opus, and the link recipe. SOURCES.txt names the exact revisions. The release workflow
-downloads this zip from the repository's "toolchain-<version>" release and puts it in the builder.
+restores this ZIP from the previous standalone builder and embeds it in the new executable.
 
     python make-toolchain-pack.py --wintc <staged toolchain folder> --opus <opus-1.6.1 source> --out <zip>
 """

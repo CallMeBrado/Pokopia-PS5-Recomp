@@ -1,8 +1,5 @@
-# Builds the Pokopia PS5 Builder (the Windows program that turns a user's own Pokopia dump into the PS5
-# title) and, for a builder-v* tag, publishes it as a release. The zip holds no game data.
-#
-# The PS5 toolchain (SDK headers/stubs, RADV, native tooling) comes from this repository's
-# "toolchain-1" release (ps5/builder/make-toolchain-pack.py); make-release.py checks its SHA-256.
+# A builder-v* tag publishes the standalone Windows executable. The first
+# standalone release is the pinned source of the toolchain ZIP embedded in later builds.
 name: Pokopia PS5 Builder
 
 on:
@@ -64,25 +61,30 @@ jobs:
         run: dotnet build ps5/builder/app/PokopiaPS5Builder.csproj -c Release -o build/app
 
       - name: Fetch the pinned toolchain
-        shell: pwsh
+        shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download toolchain-1 --pattern toolchain-1.zip --dir build
-          if ($LASTEXITCODE -ne 0) { throw "The toolchain-1 release asset is required to assemble the builder." }
-          $expected = python -c "import runpy; print(runpy.run_path('ps5/builder/make-release.py')['TOOLCHAIN'][1])"
-          if ((Get-FileHash build/toolchain-1.zip -Algorithm SHA256).Hash -ne $expected) {
-              throw "The toolchain release asset does not match the pinned SHA-256."
-          }
+          gh release download builder-standalone-v1.0.0 --pattern PokopiaPS5Builder.exe --dir build/seed
+          if ($LASTEXITCODE -ne 0) { throw "The initial standalone builder release is required to restore the pinned toolchain." }
+          $sha = python -c "import runpy; print(runpy.run_path('ps5/builder/make-release.py')['TOOLCHAIN_SHA256'])"
+          ./ps5/builder/standalone/extract-toolchain.ps1 -Launcher build/seed/PokopiaPS5Builder.exe -Out build/toolchain-1.zip -Sha256 $sha
 
-      - name: Assemble the release
+      - name: Assemble the launcher payload
         shell: pwsh
-        run: python ps5/builder/make-release.py --app build/app --out dist --toolchain-zip build/toolchain-1.zip
+        run: python ps5/builder/make-release.py --launcher-payload --app build/app --out dist --toolchain-zip build/toolchain-1.zip
+
+      - name: Build the standalone executable
+        shell: pwsh
+        run: |
+          $payload = (Resolve-Path dist/PokopiaPS5Builder-payload.zip).Path
+          $toolchain = (Resolve-Path build/toolchain-1.zip).Path
+          dotnet build ps5/builder/standalone/PokopiaPS5Builder.Standalone.csproj -c Release -o dist/standalone "-p:PayloadPath=$payload" "-p:ToolchainPath=$toolchain"
 
       - uses: actions/upload-artifact@v4
         with:
           name: PokopiaPS5Builder
-          path: dist/PokopiaPS5Builder-*.zip
+          path: dist/standalone/PokopiaPS5Builder.exe
           compression-level: 0
 
       - name: Publish the release
@@ -91,10 +93,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = Get-ChildItem dist/PokopiaPS5Builder-*.zip | Select-Object -First 1
           $notes = @"
           Pokopia PS5 Builder: builds the PS5 version of Pokopia (PPSA94010) from your own dump of
-          Pokopia 2.0.1 (update 655360). Unzip, run PokopiaPS5Builder.exe, pick your dump and an output
+          Pokopia 2.0.1 (update 655360). Open PokopiaPS5Builder.exe, pick your dump and an output
           folder, and choose a folder, exFAT, UFS2 .ffpkg, or FTP upload to your PS5. See README.txt.
           "@
-          gh release create "${{ github.ref_name }}" $zip.FullName --title "Pokopia PS5 Builder ${{ github.ref_name }}" --notes $notes
+          gh release create "${{ github.ref_name }}" dist/standalone/PokopiaPS5Builder.exe --title "Pokopia PS5 Builder ${{ github.ref_name }}" --notes $notes

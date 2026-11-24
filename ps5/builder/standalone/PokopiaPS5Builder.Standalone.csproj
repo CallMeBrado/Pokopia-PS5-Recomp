@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>PokopiaPS5Builder</AssemblyName>
+    <ApplicationIcon>../app/app.ico</ApplicationIcon>
+    <ApplicationManifest>../app/app.manifest</ApplicationManifest>
+    <Version>1.0.0</Version>
+    <Product>Pokopia PS5 Builder</Product>
+    <Copyright>GPL-3.0-or-later</Copyright>
+    <ManifestPath>$(BaseIntermediateOutputPath)$(Configuration)/standalone-manifest.txt</ManifestPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all"/>
+    <Reference Include="System.IO.Compression"/>
+    <EmbeddedResource Include="$(PayloadPath)" LogicalName="PokopiaPS5Builder.PayloadZip" Condition="'$(PayloadPath)' != ''"/>
+    <EmbeddedResource Include="$(ToolchainPath)" LogicalName="PokopiaPS5Builder.ToolchainZip" Condition="'$(ToolchainPath)' != ''"/>
+    <EmbeddedResource Include="$(ManifestPath)" LogicalName="PokopiaPS5Builder.Manifest"/>
+  </ItemGroup>
+  <Target Name="PrepareStandaloneManifest" BeforeTargets="PrepareResources">
+    <Error Condition="!Exists('$(PayloadPath)') or !Exists('$(ToolchainPath)')" Text="Set PayloadPath and ToolchainPath to the two local ZIP inputs."/>
+    <Exec Command="python &quot;$(MSBuildProjectDirectory)/manifest.py&quot; &quot;$(PayloadPath)&quot; &quot;$(ToolchainPath)&quot; &quot;$(ManifestPath)&quot;"/>
+  </Target>
+</Project>
