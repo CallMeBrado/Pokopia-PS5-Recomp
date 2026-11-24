@@ -3126,6 +3126,14 @@ static NvnFrontTextureCreateResult create_nvn_texture(void *opaque, void *device
 #endif
     if (!is_texel && texture->deferred)
         register_cold_texture(info);
+#if defined(__PROSPERO__)
+    /* Keep startup diagnostics without flushing the log under the graphics
+     * lock for every successful texture allocation. Errors still log above. */
+    static unsigned texture_creates_logged;
+    if (texture_creates_logged >= 16)
+        return NVN_FRONT_TEXTURE_CREATED;
+    ++texture_creates_logged;
+#endif
     if (is_texel) {
         fprintf(probe_log, "NVN buffer texture registered for Vulkan backing format=%u guest=%#" PRIx64
                 " bytes=%#" PRIx64 "\n", (unsigned)texture->format, info->storage_address, info->storage_size);
